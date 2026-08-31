@@ -43,6 +43,8 @@ CLASSIFIER_MODEL = os.environ.get('MAIL_WATCH_MODEL', 'claude-opus-5')
 CLASSIFIER_TIMEOUT = 180
 BATCH = 20            # писем в одном запросе к классификатору
 MAX_NOTIFY = 8        # уведомлений за проход: при наплыве остальное в дайджест
+COLD_START_DAYS = 1   # на первом запуске показываем письма за сутки
+COLD_START_LIMIT = 15
 
 NOTIFY = ('urgent', 'important')
 EMOJI = {'urgent': '🔴', 'important': '🟡', 'routine': '⚪', 'noise': '·'}
@@ -162,8 +164,21 @@ def _new_messages(alias: str, state: dict) -> list:
 
     if not box.get('history_id'):
         box['history_id'] = current
-        log(f'{alias}: первый запуск, точка отсчёта {current}')
-        return []
+        # Холодный старт. Молчать нельзя: письмо, пришедшее за час до
+        # запуска, человек уже видел в почте, а бот про него не скажет —
+        # выглядит как сломанный воркер. Но и всю историю поднимать не
+        # надо, поэтому берём узкое окно последних часов.
+        try:
+            resp = svc.users().messages().list(
+                userId='me', q=f'in:inbox newer_than:{COLD_START_DAYS}d',
+                maxResults=COLD_START_LIMIT).execute()
+            ids = [m['id'] for m in resp.get('messages', [])]
+        except Exception as e:
+            log(f'{alias}: холодный старт не удался ({e})')
+            ids = []
+        log(f'{alias}: первый запуск, точка отсчёта {current}, '
+            f'свежих писем {len(ids)}')
+        return _fetch_meta(svc, alias, ids)
 
     ids, page = [], None
     try:
@@ -193,6 +208,11 @@ def _new_messages(alias: str, state: dict) -> list:
             return []
         raise
 
+    return _fetch_meta(svc, alias, ids)
+
+
+def _fetch_meta(svc, alias: str, ids: list) -> list:
+    """Дотягивает отправителя и тему. Тело письма не запрашиваем вовсе."""
     items = []
     for mid in ids[:50]:          # потолок на проход, чтобы не залипнуть
         try:
@@ -256,9 +276,23 @@ def _classify(items: list, meta: dict) -> list:
             [gt_claude_bin(), '-p', '--model', CLASSIFIER_MODEL,
              '--output-format', 'json', prompt],
             capture_output=True, text=True, timeout=CLASSIFIER_TIMEOUT)
-        raw = json.loads(proc.stdout).get('result', '') if proc.stdout else ''
+        # claude --output-format json отдаёт МАССИВ событий (rate_limit,
+        # system, assistant, result), а не объект. Ответ лежит в элементе
+        # с type=result; вызов .get() прямо на списке падал, и всё письмо
+        # уходило в fallback «important» — включая явную рекламу.
+        data = json.loads(proc.stdout) if proc.stdout.strip() else []
+        if isinstance(data, list):
+            raw = next((e.get('result', '') for e in reversed(data)
+                        if isinstance(e, dict) and e.get('type') == 'result'), '')
+        else:
+            raw = data.get('result', '')
+        if not raw:
+            raise ValueError(f'пустой ответ, rc={proc.returncode}, '
+                             f'stderr={proc.stderr[:200]}')
         m = re.search(r'\[.*\]', raw, re.DOTALL)
         verdicts = json.loads(m.group(0)) if m else []
+        if not verdicts:
+            raise ValueError(f'не нашёл JSON в ответе: {raw[:200]}')
     except Exception as e:
         log(f'классификатор недоступен ({e}) — считаю всё important')
         verdicts = []
