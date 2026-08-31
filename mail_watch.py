@@ -24,6 +24,7 @@ historyId: с сервера приходят ТОЛЬКО изменения с
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -99,8 +100,38 @@ def _save_state(state: dict) -> None:
     os.replace(tmp, STATE)
 
 
+LOCK = STATE.with_suffix('.lock')
+
+
+def _exclusive():
+    """Гарантия единственного писателя состояния.
+
+    once или discover параллельно с работающей службой — это два писателя
+    watch_state.json: у службы своя копия состояния в памяти, и кто
+    сохранился последним, тот и прав — history_id откатывается, письма
+    уведомляются дважды. Лок живёт, пока жив возвращённый файловый
+    объект, поэтому вызывающий обязан держать на него ссылку.
+    """
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    # 'a', не 'w': открытие происходит ДО захвата, и неудачливый претендент
+    # не должен затирать pid держателя ('w' обрезает файл при открытии)
+    fh = open(LOCK, 'a')
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(
+            'состояние занято другим процессом — обычно это работающая '
+            'служба mail-watch. Останови её и повтори:\n'
+            '  systemctl --user stop mail-watch')
+    fh.truncate(0)
+    fh.write(f'{os.getpid()}\n')      # кто держит — видно в файле
+    fh.flush()
+    return fh
+
+
 def cmd_discover(args) -> int:
     """Находит chat_id по сообщению, которое Никита прислал боту."""
+    lock = _exclusive()               # пишем state — служба не должна затереть
     if getattr(args, 'drop_webhook', False):
         _tg('deleteWebhook')
         print('вебхук снят')
@@ -415,6 +446,7 @@ def _pass_once(state: dict) -> int:
 
 
 def cmd_once(args) -> int:
+    lock = _exclusive()
     state = _load_state()
     n = _pass_once(state)
     log(f'проход завершён, писем обработано: {n}')
@@ -422,6 +454,7 @@ def cmd_once(args) -> int:
 
 
 def cmd_run(args) -> int:
+    lock = _exclusive()               # второй воркер — это всегда авария
     log(f'воркер запущен, интервал {POLL_INTERVAL}с, модель {CLASSIFIER_MODEL}')
     state = _load_state()
     while True:
