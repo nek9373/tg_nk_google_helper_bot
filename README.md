@@ -1,4 +1,4 @@
-# mailwatch — почта для агентов
+# tg_nk_google_helper_bot — почта для агентов
 
 Два инструмента вокруг Gmail:
 
@@ -112,7 +112,7 @@ systemctl --user daemon-reload && systemctl --user enable --now mail-watch
 ## Как это связано с остальным
 
 ```
-mailwatch/                 ← этот проект: доступ к почте + воркер
+tg_nk_google_helper_bot/   ← этот проект: доступ к почте + воркер
   gmail_tool.py            ↖ симлинк в bot_workspace/scripts обоих ботов
   mail_watch.py            ↗
 bots_bus/                  координация двух ботов (локи, решения) — почты не касается
