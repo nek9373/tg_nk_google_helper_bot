@@ -1,4 +1,8 @@
 [Unit]
+# Лимит рестартов — только в [Unit]; в [Service] systemd его игнорирует,
+# и разовый сбой сети мог бы убить юнит насмерть
+StartLimitIntervalSec=600
+StartLimitBurst=20
 Description=Mail watcher — новые письма, сортировка через Opus 5, уведомления в Telegram
 After=network-online.target
 Wants=network-online.target
@@ -13,9 +17,6 @@ Environment=MAIL_WATCH_INTERVAL=120
 ExecStart=/home/nklyuchnikov/PycharmProjects/tg_nk_google_helper_bot/.venv/bin/python /home/nklyuchnikov/PycharmProjects/tg_nk_google_helper_bot/mail_watch.py run
 Restart=always
 RestartSec=30
-# Разовый сбой сети не должен убивать юнит насмерть
-StartLimitIntervalSec=600
-StartLimitBurst=20
 
 [Install]
 WantedBy=default.target
