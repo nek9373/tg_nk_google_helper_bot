@@ -35,13 +35,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gmail_tool as gt
 
-TOKEN_FILE = Path(os.environ.get('MAIL_WATCH_TOKEN_FILE', '/tmp/bot_api.txt'))
+# Токен — в конфиге, а не в /tmp: tmpfs не переживает ребут, а права
+# по умолчанию делали файл читаемым для всех процессов машины.
+TOKEN_FILE = Path(os.environ.get('MAIL_WATCH_TOKEN_FILE',
+                                 gt.HOME_CFG / 'bot_token.txt'))
 STATE = Path(os.environ.get('MAIL_WATCH_STATE',
                             gt.HOME_CFG / 'watch_state.json'))
 POLL_INTERVAL = int(os.environ.get('MAIL_WATCH_INTERVAL', '120'))
 CLASSIFIER_MODEL = os.environ.get('MAIL_WATCH_MODEL', 'claude-opus-5')
 CLASSIFIER_TIMEOUT = 180
 BATCH = 20            # писем в одном запросе к классификатору
+FETCH_CAP = 50        # потолок писем с ящика за проход; хвост дочитывается следующим
 MAX_NOTIFY = 8        # уведомлений за проход: при наплыве остальное в дайджест
 COLD_START_DAYS = 1   # на первом запуске показываем письма за сутки
 COLD_START_LIMIT = 15
@@ -180,7 +184,12 @@ def _new_messages(alias: str, state: dict) -> list:
             f'свежих писем {len(ids)}')
         return _fetch_meta(svc, alias, ids)
 
+    # history_id продвигаем ровно до последней ОБРАБОТАННОЙ записи, а не до
+    # верхушки ящика: раньше при наплыве хвост за потолком считался
+    # «увиденным» и молча пропадал из уведомлений.
     ids, page = [], None
+    done_hid = None       # история обработана включительно до этого id
+    truncated = False
     try:
         while True:
             resp = svc.users().history().list(
@@ -188,6 +197,9 @@ def _new_messages(alias: str, state: dict) -> list:
                 historyTypes=['messageAdded'], labelId='INBOX',
                 pageToken=page).execute()
             for h in resp.get('history', []):
+                if len(ids) >= FETCH_CAP:
+                    truncated = True
+                    break
                 for added in h.get('messagesAdded', []):
                     m = added.get('message', {})
                     labels = m.get('labelIds', [])
@@ -195,6 +207,13 @@ def _new_messages(alias: str, state: dict) -> list:
                     if 'INBOX' in labels and 'DRAFT' not in labels \
                             and 'SENT' not in labels:
                         ids.append(m['id'])
+                done_hid = h.get('id')
+            if truncated:
+                log(f'{alias}: новых больше {FETCH_CAP}, '
+                    f'хвост заберу следующим проходом')
+                if done_hid:
+                    box['history_id'] = done_hid
+                break
             page = resp.get('nextPageToken')
             if not page:
                 box['history_id'] = resp.get('historyId', current)
@@ -212,9 +231,14 @@ def _new_messages(alias: str, state: dict) -> list:
 
 
 def _fetch_meta(svc, alias: str, ids: list) -> list:
-    """Дотягивает отправителя и тему. Тело письма не запрашиваем вовсе."""
+    """Дотягивает отправителя и тему. Тело письма не запрашиваем вовсе.
+
+    Размер списка ограничивает вызывающий (FETCH_CAP при опросе,
+    COLD_START_LIMIT на холодном старте) — здесь резать нельзя: всё, что
+    сюда попало, уже засчитано в history_id как обработанное.
+    """
     items = []
-    for mid in ids[:50]:          # потолок на проход, чтобы не залипнуть
+    for mid in ids:
         try:
             msg = svc.users().messages().get(
                 userId='me', id=mid, format='metadata',
@@ -350,6 +374,10 @@ def _notify(sorted_items: list) -> None:
 
 
 def _pass_once(state: dict) -> int:
+    # Токен и chat_id проверяем ДО опроса: уведомлять нечем — проход должен
+    # упасть раньше, чем сдвинется history_id и потратится классификатор.
+    _token()
+    _chat_id()
     aliases = sorted(p.stem for p in gt.TOKENS.glob('*.json'))
     if not aliases:
         log('нет подключённых ящиков')
@@ -368,9 +396,9 @@ def _pass_once(state: dict) -> int:
         if items:
             log(f'{alias}: новых писем {len(items)}')
             found.extend(items)
-    _save_state(state)
 
     if not found:
+        _save_state(state)
         return 0
     sorted_items = []
     for i in range(0, len(found), BATCH):
@@ -379,6 +407,10 @@ def _pass_once(state: dict) -> int:
         log(f"  {EMOJI[it['category']]} {it['category']:9} "
             f"{it['subject'][:50]}")
     _notify(sorted_items)
+    # Состояние — только ПОСЛЕ уведомлений: упавший между опросом и
+    # отправкой проход не должен молча съедать письма. Цена — возможный
+    # дубль уведомления, это дешевле пропажи.
+    _save_state(state)
     return len(sorted_items)
 
 
@@ -395,8 +427,14 @@ def cmd_run(args) -> int:
     while True:
         try:
             _pass_once(state)
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # SystemExit тоже ловим: конфиг-ошибка (пропал файл токена,
+            # нет chat_id) лечится файлом на диске, а не смертью воркера —
+            # раньше она убивала процесс, и systemd крутил его в рестартах.
             log(f'проход упал: {e}')
+            # Незаписанные продвижения history_id отбрасываем: на диске
+            # состояние ДО упавшего прохода, письма будут перечитаны.
+            state = _load_state()
         time.sleep(POLL_INTERVAL)
 
 
