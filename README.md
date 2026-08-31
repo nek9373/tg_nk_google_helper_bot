@@ -1,151 +1,187 @@
-# tg_nk_google_helper_bot — почта для агентов
+# tg_nk_google_helper_bot — важная почта для Никиты
 
-Два инструмента вокруг Gmail:
+Цель проекта одна: Никита должен узнавать о важных письмах, а оценка важности
+должна постепенно подстраиваться под его решения.
 
-- **`gmail_tool.py`** — доступ к нескольким ящикам сразу, в том числе в разных
-  Google Workspace. Чтение и черновики; отправка выключена по умолчанию.
-- **`mail_watch.py`** — воркер: следит за новыми письмами, сортирует их через
-  Opus 5 и шлёт важное в Telegram-бот **@nk_google_helper_bot**.
+Проект состоит из двух независимых инструментов:
 
-Зачем не плагин и не готовый коннектор: они дают ровно один ящик — тот, под
-которым выполнен вход. Здесь ящиков семь и они в разных организациях, поэтому
-у каждого свой refresh token, а выбор ящика — явный аргумент команды.
+- `gmail_tool.py` — явный доступ агентов к семи Gmail-ящикам: поиск, чтение,
+  черновики; отправка закрыта отдельным OAuth-разрешением и флагом `--yes`;
+- `mail_watch.py` — постоянный worker: Gmail → надёжная очередь → классификация
+  → Telegram-бот `@nk_google_helper_bot` → обратная связь кнопками.
 
-Отдельный проект, потому что это самостоятельный сервис: свой venv, свой
-systemd-юнит, своё состояние. Раньше жил в `bots_bus`, но тот про
-координацию двух ботов, а почта к ней отношения не имеет. Заодно ушла
-зависимость от venv проекта `some` — обновление зависимостей там больше
-не может сломать почту.
+Оба агента (`some` и `some_codex`) видят `gmail_tool.py` через симлинки. Worker
+самостоятелен и продолжает следить за почтой, даже когда агенты выключены.
 
-Оба бота (`../some`, `../some_codex`) видят инструменты через симлинки в
-своих `bot_workspace/scripts/`.
+## Что видит Никита
 
-## gmail_tool.py — доступ к ящикам
+Срочные и важные письма приходят отдельными обычными Telegram-уведомлениями.
+Под каждым четыре кнопки:
 
-Имя ящика = сам адрес: в одном домене их бывает несколько.
+- `🔴 срочно`;
+- `🟡 важное`;
+- `⚪ неважное`;
+- `· мусор`.
+
+Нажатие сохраняется как персональный пример. Следующие похожие письма
+классификатор получает вместе с релевантными прошлыми решениями. Один клик не
+создаёт вечного правила для всего домена: тема, ящик и повторяемость остаются
+важны, а решение можно исправить другой кнопкой.
+
+Уверенно неважные письма не пропадают в чёрном ящике. Они приходят тихим
+компактным дайджестом с отправителем и темой; любое из них можно поднять кнопкой
+`↑ важное`. Команда `/recent` показывает последние письма, включая скрытые.
+
+Команды бота:
+
+```text
+/status   здоровье очереди и число поправок
+/recent   последние 12 писем
+/help     краткая инструкция
+```
+
+## Почему письмо не теряется
+
+Состояние живёт в DigitalOcean Managed MySQL, база `agent_mail`, отдельный
+пользователь `mail_watch`, соединение TLS с проверкой CA.
+
+Порядок обработки:
+
+1. Gmail отдаёт новые message id и следующий `historyId`.
+2. Все id и новый cursor фиксируются одной MySQL-транзакцией.
+3. Отдельно подтягиваются только метаданные, затем классификация.
+4. Только успешный `sendMessage` помечает письмо доставленным.
+5. Любая ошибка оставляет запись в очереди для следующей попытки.
+
+Если MySQL недоступен, Gmail-cursor не продвигается. Если Telegram недоступен,
+письмо уже лежит в outbox. При неоднозначном сетевом таймауте возможен редкий
+дубль уведомления — это сознательная модель at-least-once: дубль лучше потери.
+
+Другие закрытые дыры старой версии:
+
+- после восьмого важного письма больше нет голого счётчика: хвост остаётся в
+  очереди и досылается;
+- лимит первых 50 metadata больше не отбрасывает остальные id;
+- протухший Gmail `historyId` запускает полный постраничный sync Inbox и только
+  после его завершения двигает cursor;
+- второй worker/ручной `once` получает явный отказ через локальный lock и
+  глобальный MySQL lease;
+- callbacks принимаются только от привязанного Telegram user id;
+- поломка Opus fail-open: письмо считается `important`.
+
+## Приватность и классификация
+
+В `claude-opus-5` уходят только:
+
+- адрес и имя отправителя;
+- тема;
+- назначение ящика;
+- Gmail labels и признак массовой рассылки;
+- релевантные прошлые оценки Никиты.
+
+Тело письма не запрашивается watcher-ом и в модель не уходит. Заголовки
+считаются недоверенными данными. Классификатор запускается без tools, MCP,
+hooks, project-инструкций и session persistence; prompt передаётся через stdin.
+Поэтому тема письма может повлиять только на предложенную категорию, но не
+получает shell/files/network. Локально/в MySQL сохраняются только эти
+метаданные, категория, причина и доставка.
+
+## Gmail-инструмент для агентов
+
+Имя ящика — его полный адрес:
 
 ```bash
-gmail_tool.py add me@company.com                  # подключить
-gmail_tool.py add a@x.com b@y.com                 # пачкой, подряд
-gmail_tool.py add me@company.com --with-send      # + право отправки
-gmail_tool.py add me@company.com --paste          # браузер на другой машине
-
-gmail_tool.py list                                # ящики и назначение
+gmail_tool.py list
 gmail_tool.py search me@company.com "is:unread" -n 5 --snippet
-gmail_tool.py read me@company.com <id>
-gmail_tool.py draft me@company.com --to a@b.c --subject "Т" --body -
-gmail_tool.py describe me@company.com --purpose "для чего ящик"
-gmail_tool.py rename старое новое
-gmail_tool.py revoke me@company.com
+gmail_tool.py read me@company.com <message_id>
+gmail_tool.py draft me@company.com --to a@b.c --subject "Тема" --body -
 ```
 
-Права по умолчанию — чтение и черновики. Отправка только с `--with-send`,
-и каждый `send` требует ещё и `--yes`: письмо не отзывается, а агент
-ошибается молча.
-
-## mail_watch.py — воркер входящей почты
+Подключение:
 
 ```bash
-mail_watch.py discover     # найти chat_id: написать боту и запустить
-mail_watch.py once         # один проход, для проверки
-mail_watch.py status       # какие ящики под наблюдением
-mail_watch.py run          # цикл (systemd)
+gmail_tool.py add me@company.com
+gmail_tool.py add me@company.com --with-send   # только по явному решению
+gmail_tool.py describe me@company.com --purpose "для чего этот ящик"
 ```
 
-Пишущие команды (`run`, `once`, `discover`) держат эксклюзивный лок на
-состояние: `once` при работающей службе честно откажет вместо того, чтобы
-откатить ей `history_id` и продублировать уведомления. Для ручного прохода
-сначала `systemctl --user stop mail-watch`. `status` только читает — его
-можно всегда.
+`send` требует одновременно scope `gmail.send` у конкретного ящика и явный
+`--yes`. По умолчанию агенты читают и создают черновики.
 
-Вебхуки не используются. У Gmail push есть (`users.watch` + Cloud Pub/Sub),
-но ему нужен проект в Cloud, топик, подписка и живой endpoint. Опрос по
-`historyId` дешевле: приходят только изменения с прошлой проверки, а не
-список писем.
-
-Первый проход по ящику лишь запоминает точку отсчёта — иначе воркер вывалил
-бы в Telegram всю накопленную почту. Протухший `historyId` (Gmail хранит
-историю около недели) молча заменяется текущим.
-
-Сортировка: отправитель и тема уходят в `claude-opus-5`, **тело письма
-машину не покидает**. `urgent` и `important` идут отдельными сообщениями,
-`routine` и `noise` — строкой дайджеста, не больше 8 уведомлений за проход.
-Классификатор недоступен — всё считается `important`: лишнее уведомление
-лучше пропущенного письма.
-
-## Установка
+## Установка и provisioning
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# секрет OAuth-клиента из Google Cloud
-mkdir -p ~/.config/agent_gmail/tokens && chmod 700 ~/.config/agent_gmail
-cp <client_secret>.json ~/.config/agent_gmail/client_secret.json
-chmod 600 ~/.config/agent_gmail/client_secret.json
+.venv/bin/python provision_mysql.py \
+  --cluster db-mysql-fra1-42798 \
+  --database agent_mail \
+  --user mail_watch
 
-# токен Telegram-бота
-echo '<токен от BotFather>' > ~/.config/agent_gmail/bot_token.txt
-chmod 600 ~/.config/agent_gmail/bot_token.txt
-
-cp mail-watch.service ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now mail-watch
+install -m 644 mail-watch.service ~/.config/systemd/user/mail-watch.service
+systemctl --user daemon-reload
+systemctl --user enable --now mail-watch.service
 ```
 
-## Где что лежит
+`provision_mysql.py` берёт DigitalOcean API token из
+`~/.config/aeolian/do_token`, создаёт отдельные database/user, скачивает CA и
+пишет runtime-config без вывода пароля в терминал. Provisioner добавляет текущий
+public IP в DigitalOcean trusted sources через GET→merge→PUT→readback, выполняет
+миграцию схемы и затем оставляет runtime-пользователю только DML в `agent_mail`.
 
-| | |
+Первичная привязка Telegram выполняется только при остановленном worker:
+
+```bash
+systemctl --user stop mail-watch
+.venv/bin/python mail_watch.py discover --owner-user-id <ваш Telegram user id>
+systemctl --user start mail-watch
+```
+
+Старая `watch_state.json` мигрируется в MySQL один раз и не удаляется.
+
+## Файлы и секреты
+
+| Назначение | Путь |
 |---|---|
-| секрет клиента | `~/.config/agent_gmail/client_secret.json` |
-| токены ящиков | `~/.config/agent_gmail/tokens/<адрес>.json` |
-| назначения ящиков | `~/.config/agent_gmail/mailboxes.json` |
-| состояние воркера | `~/.config/agent_gmail/watch_state.json` |
-| токен Telegram-бота | `~/.config/agent_gmail/bot_token.txt` |
+| OAuth client Gmail | `~/.config/agent_gmail/client_secret.json` |
+| Gmail refresh tokens | `~/.config/agent_gmail/tokens/<адрес>.json` |
+| Назначения ящиков | `~/.config/agent_gmail/mailboxes.json` |
+| Старое состояние/cursor | `~/.config/agent_gmail/watch_state.json` |
+| MySQL runtime config | `~/.config/agent_gmail/mysql.json` |
+| DigitalOcean MySQL CA | `~/.config/agent_gmail/do_mysql_ca.crt` |
+| Telegram bot token | `~/.config/agent_gmail/bot_token.txt` |
 
-В репозиторий не попадает ничего из этого. Файл токена держите с правами
-`600`: он даёт полный контроль над ботом.
+Все секретные файлы имеют mode `0600` и не входят в репозиторий.
 
-## Настройки через окружение
+## Операции и проверки
 
-| переменная | по умолчанию |
+```bash
+.venv/bin/python mail_watch.py status
+.venv/bin/python mail_watch.py once       # только при остановленном service
+.venv/bin/python mail_watch.py announce   # прислать владельцу /help
+
+.venv/bin/python -m unittest discover -s tests -v
+MAIL_WATCH_INTEGRATION=1 \
+  .venv/bin/python -m unittest discover -s tests \
+  -p 'test_mail_store_integration.py' -v
+```
+
+Настройки окружения:
+
+| Переменная | По умолчанию |
 |---|---|
-| `MAIL_WATCH_INTERVAL` | `120` секунд между проходами |
+| `MAIL_WATCH_INTERVAL` | `120` секунд |
+| `MAIL_WATCH_TELEGRAM_POLL` | `15` секунд |
 | `MAIL_WATCH_MODEL` | `claude-opus-5` |
+| `MAIL_WATCH_CLASSIFIER_TIMEOUT` | `60` секунд; один сбой включает fail-open на цикл |
+| `MAIL_WATCH_CONFIDENCE_FLOOR` | `0.72` |
+| `MAIL_WATCH_MYSQL_CONFIG` | `~/.config/agent_gmail/mysql.json` |
 | `MAIL_WATCH_TOKEN_FILE` | `~/.config/agent_gmail/bot_token.txt` |
-| `GMAIL_TOKENS_DIR` | `~/.config/agent_gmail/tokens` |
 
-## Как это связано с остальным
+## Граница для игр
 
-```
-tg_nk_google_helper_bot/   ← этот проект: доступ к почте + воркер
-  gmail_tool.py            ↖ симлинк в bot_workspace/scripts обоих ботов
-  mail_watch.py            ↗
-bots_bus/                  координация двух ботов (локи, решения) — почты не касается
-some/                      бот Клоди   (Claude Opus 5)
-some_codex/                бот Кодекс  (Codex gpt-5.6-sol)
-```
-
-Оба бота пользуются `gmail_tool.py` через симлинки, поэтому инструмент один и
-правится в одном месте. Воркер к ботам не привязан: он самостоятельный сервис
-со своим Telegram-ботом и работает, даже когда оба агента выключены.
-
-## Как это ведёт себя в жизни
-
-Первый запуск ничего не присылает — только запоминает точку отсчёта по каждому
-ящику. Иначе первое же уведомление вывалило бы всю накопленную почту, а в одном
-ящике её больше ста тысяч писем.
-
-Дальше каждые две минуты воркер спрашивает у Gmail, что изменилось с прошлого
-раза. Приходят только новые письма во «Входящих» — свои отправленные и черновики
-отсеиваются. Отправитель и тема уходят в Opus 5, он ставит категорию и одну
-фразу «почему». Красное и жёлтое приходят отдельными сообщениями, серое — одной
-строкой вида «· 4 обычных, 11 рассылок».
-
-Что осознанно сделано «слишком осторожно»:
-
-- **тело письма не покидает машину** — в модель уходят только адрес и тема;
-- **отправка выключена** — агент готовит черновик, кнопку нажимает человек;
-- **потолок в 8 уведомлений за проход** — при наплыве остаток идёт в дайджест,
-  чтобы утренняя пачка писем не превратилась в сорок сообщений подряд;
-- **классификатор недоступен → всё important** — лишнее уведомление лучше
-  пропущенного письма.
+Мобильная игра никогда не подключается к MySQL напрямую: пароль оказался бы в
+APK. Если кластер понадобится для телеметрии, экономики или Remote Config,
+между игрой и базой обязателен серверный API с аутентификацией, rate limits и
+минимальными правами отдельного пользователя.

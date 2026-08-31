@@ -37,10 +37,12 @@ refresh token, а выбор ящика — явный аргумент кома
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -65,6 +67,34 @@ TESTING_TOKEN_TTL = 7 * 24 * 3600
 # неделю), и описание терялось бы вместе с ним. Плюс этот файл не
 # секретный: его можно править руками и целиком показывать агенту.
 MAILBOXES = Path(os.environ.get("GMAIL_MAILBOXES", HOME_CFG / "mailboxes.json"))
+WATCH_DB_CONFIG = Path(
+    os.environ.get("MAIL_WATCH_MYSQL_CONFIG", HOME_CFG / "mysql.json")
+)
+WATCH_LOCK = Path(os.environ.get("MAIL_WATCH_LOCK", HOME_CFG / "watch_state.lock"))
+
+
+@contextmanager
+def _watcher_admin():
+    """Serialize alias lifecycle with the watcher and central DB."""
+    if not WATCH_DB_CONFIG.exists():
+        yield None
+        return
+    WATCH_LOCK.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = open(WATCH_LOCK, "a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            _fail("останови mail-watch.service перед rename/revoke")
+        from mail_store import MailStore
+        store = MailStore(WATCH_DB_CONFIG)
+        try:
+            store.acquire_worker_lease()
+            yield store
+        finally:
+            store.close()
+    finally:
+        handle.close()
 
 
 def _load_meta() -> dict:
@@ -341,15 +371,23 @@ def cmd_rename(args) -> int:
         _fail(f'алиас {args.new!r} уже занят: {busy}')
     data = json.loads(src.read_text(encoding='utf-8'))
     data['_alias'] = args.new      # метаданные не должны врать про имя
-    tmp = dst.with_suffix('.tmp')
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, dst)
-    src.unlink()
-    meta = _load_meta()          # описание должно переехать вместе с ящиком
-    if args.old in meta:
-        meta[args.new] = meta.pop(args.old)
-        _save_meta(meta)
+    with _watcher_admin() as store:
+        if store:
+            store.rename_mailbox(args.old, args.new)
+        try:
+            tmp = dst.with_suffix('.tmp')
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, dst)
+            src.unlink()
+            meta = _load_meta()      # описание должно переехать вместе с ящиком
+            if args.old in meta:
+                meta[args.new] = meta.pop(args.old)
+                _save_meta(meta)
+        except Exception:
+            if store:
+                store.rename_mailbox(args.new, args.old)
+            raise
     print(f'{args.old} → {args.new}  ({data.get("_email", "?")})')
     return 0
 
@@ -373,10 +411,13 @@ def cmd_revoke(args) -> int:
     except Exception as e:
         print(f'отзыв на стороне Google не удался ({e}) — удаляю локально',
               file=sys.stderr)
-    path.unlink()
-    meta = _load_meta()
-    if meta.pop(args.alias, None) is not None:
-        _save_meta(meta)
+    with _watcher_admin() as store:
+        if store:
+            store.retire_mailbox(args.alias)
+        path.unlink()
+        meta = _load_meta()
+        if meta.pop(args.alias, None) is not None:
+            _save_meta(meta)
     print(f'токен {args.alias} удалён')
     return 0
 

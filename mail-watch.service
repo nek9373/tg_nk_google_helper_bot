@@ -1,8 +1,7 @@
 [Unit]
 # Лимит рестартов — только в [Unit]; в [Service] systemd его игнорирует,
 # и разовый сбой сети мог бы убить юнит насмерть
-StartLimitIntervalSec=600
-StartLimitBurst=20
+StartLimitIntervalSec=0
 Description=Mail watcher — новые письма, сортировка через Opus 5, уведомления в Telegram
 After=network-online.target
 Wants=network-online.target
@@ -14,9 +13,18 @@ WorkingDirectory=/home/nklyuchnikov/PycharmProjects/tg_nk_google_helper_bot
 Environment=PATH=/home/nklyuchnikov/.npm-global/bin:/home/nklyuchnikov/.nvm/versions/node/v22.21.1/bin:/home/nklyuchnikov/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=MAIL_WATCH_INTERVAL=120
+Environment=MAIL_WATCH_TOKEN_FILE=/home/nklyuchnikov/.config/agent_gmail/bot_token.txt
+Environment=MAIL_WATCH_MYSQL_CONFIG=/home/nklyuchnikov/.config/agent_gmail/mysql.json
+Environment=MAIL_WATCH_SCHEMA_MIGRATE=0
+UMask=0077
+ExecStartPre=/usr/bin/test -r /home/nklyuchnikov/.config/agent_gmail/bot_token.txt
+ExecStartPre=/usr/bin/test -r /home/nklyuchnikov/.config/agent_gmail/mysql.json
 ExecStart=/home/nklyuchnikov/PycharmProjects/tg_nk_google_helper_bot/.venv/bin/python /home/nklyuchnikov/PycharmProjects/tg_nk_google_helper_bot/mail_watch.py run
-Restart=always
-RestartSec=30
+Restart=on-failure
+RestartSec=15
+RestartSteps=6
+RestartMaxDelaySec=300
+TimeoutStopSec=20
 
 [Install]
 WantedBy=default.target
