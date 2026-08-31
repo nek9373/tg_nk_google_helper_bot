@@ -6,10 +6,16 @@
 ящиков несколько, и они в разных Workspace, поэтому у каждого свой
 refresh token, а выбор ящика — явный аргумент команды.
 
-Права по умолчанию: ЧИТАТЬ и СОЗДАВАТЬ ЧЕРНОВИКИ. Отправку агент не
-получает, пока ящик не подключён с --with-send. Письмо, ушедшее не тому
-адресату, не отзывается, а ошибается агент молча — поэтому по умолчанию
-он готовит, а кнопку нажимает человек.
+Права по умолчанию: ПОЛНЫЕ — почта, YouTube (включая заливку),
+календарь, диск. Так решил Никита: это его аккаунты, и держать агента на
+чтении оказалось неудобно. Страховки перенесены на уровень команд:
+отправка письма требует явного --yes, публикация видео — подтверждения.
+Отдельный ящик можно ограничить флагом --readonly.
+
+Важно про YouTube: у непроверенного проекта видео, залитые через API,
+принудительно остаются private и опубликовать их нельзя, пока проект не
+пройдёт compliance audit. Всё остальное — метаданные, плейлисты,
+комментарии, аналитика — работает сразу.
 
 Первая настройка (делает Никита, один раз):
     mkdir -p ~/.config/agent_gmail/tokens && chmod 700 ~/.config/agent_gmail
@@ -51,11 +57,48 @@ CLIENT_SECRET = Path(os.environ.get('GMAIL_CLIENT_SECRET',
                                     HOME_CFG / 'client_secret.json'))
 TOKENS = Path(os.environ.get('GMAIL_TOKENS_DIR', HOME_CFG / 'tokens'))
 
+# Полный доступ по умолчанию — решение Никиты 31.08.2026: это его
+# аккаунты, и держать агента на чтении оказалось неудобно. Страховки
+# остались на уровне команд, а не прав: send требует явного --yes,
+# заливка видео — подтверждения.
+FULL_SCOPES = [
+    'https://mail.google.com/',                              # почта целиком
+    'https://www.googleapis.com/auth/youtube.force-ssl',     # канал, комментарии
+    'https://www.googleapis.com/auth/youtube.upload',        # заливка видео
+    'https://www.googleapis.com/auth/yt-analytics.readonly',  # статистика канала
+    'https://www.googleapis.com/auth/calendar',              # календарь
+    'https://www.googleapis.com/auth/drive',                 # диск
+]
+
+# Осторожный набор — если для какого-то ящика полный доступ ни к чему
 READ_SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.compose',   # черновики, без отправки
 ]
 SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send'
+
+# По каким scope видно, что сервис доступен — для вывода в list
+SERVICE_MARKS = [
+    ('почта',     ('mail.google.com', 'gmail.')),
+    ('YouTube',   ('youtube',)),
+    ('календарь', ('auth/calendar',)),
+    ('диск',      ('auth/drive',)),
+]
+
+
+def _services(scopes) -> str:
+    """Человеческий список сервисов по выданным scope."""
+    out = []
+    for name, marks in SERVICE_MARKS:
+        if any(any(m in s for m in marks) for s in (scopes or [])):
+            out.append(name)
+    return ', '.join(out) or '—'
+
+
+def _can_send(scopes) -> bool:
+    """Полный доступ к почте тоже разрешает отправку, не только gmail.send."""
+    return any(s.endswith('gmail.send') or s == 'https://mail.google.com/'
+               for s in (scopes or []))
 
 # Consent screen в режиме Testing выдаёт refresh token на 7 дней — потом
 # ящик придётся подключать заново. Предупреждаем заранее, а не когда всё
@@ -225,9 +268,11 @@ def _add_one(alias: str, args, skip_busy: bool = False) -> int:
     # из алиаса, и сверка «под кем реально вошли» работает сама.
     email = args.email or (alias if '@' in alias else '')
 
-    scopes = list(READ_SCOPES)
-    if args.with_send:
-        scopes.append(SEND_SCOPE)
+    # По умолчанию — всё; --readonly оставляет ящик на чтении и черновиках
+    if args.readonly:
+        scopes = list(READ_SCOPES) + ([SEND_SCOPE] if args.with_send else [])
+    else:
+        scopes = list(FULL_SCOPES)
 
     path = _token_path(alias)
     if path.exists() and not args.force:
@@ -249,11 +294,11 @@ def _add_one(alias: str, args, skip_busy: bool = False) -> int:
             hint = (f'\nЭто ДРУГОЙ ящик — назови его адресом:\n'
                     f'  gmail_tool.py add {email}\n')
         _fail(f'алиас {alias!r} уже занят: {busy}.{hint}'
-              f'\nЕсли правда нужно ЗАМЕНИТЬ {busy} — добавь --force '
-              f'(старый токен будет отозван и удалён).')
+              f'\nПереподключить {busy} с новыми правами — добавь --force '
+              f'(старый токен перезапишется).')
 
-    if args.with_send:
-        print('  права: чтение + черновики + ОТПРАВКА')
+    print(f'  права: {"чтение и черновики" if args.readonly else "полные"} '
+          f'({_services(scopes)})')
     flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET), scopes)
     # login_hint подставляет нужный адрес в форму выбора аккаунта; consent
     # форсируем, иначе Google переиспользует прошлое согласие и не отдаст
@@ -328,14 +373,14 @@ def cmd_list(args) -> int:
             print(f'{path.stem:12} — файл повреждён')
             continue
         scopes = d.get('scopes', [])
-        can_send = any(s.endswith('gmail.send') for s in scopes)
+        can_send = _can_send(scopes)
         age = time.time() - d.get('_connected_at', 0)
         warn = ''
         if d.get('_connected_at') and age > TESTING_TOKEN_TTL:
             warn = '  ⚠ старше 7 дней — если consent screen в Testing, уже протух'
         purpose = meta.get(path.stem, {}).get("purpose", "")
-        rights = "чтение+черновики+ОТПРАВКА" if can_send else "чтение+черновики"
-        print(f"{path.stem:26} {rights}{warn}")
+        rights = _services(scopes) + ('' if can_send else ' (без отправки)')
+        print(f"{path.stem:30} {rights}{warn}")
         print(f"    {purpose or '— назначение не указано'}")
     return 0
 
@@ -516,7 +561,7 @@ def cmd_draft(args) -> int:
 def cmd_send(args) -> int:
     """Отправка. Доступна только если ящик подключён с --with-send."""
     creds = _load_creds(args.alias)
-    if not any(s.endswith('gmail.send') for s in (creds.scopes or [])):
+    if not _can_send(creds.scopes):
         _fail(f'у ящика {args.alias!r} нет права отправки. Это намеренно: '
               f'сделай черновик (draft) или переподключи ящик с --with-send, '
               f'если отправка от агента действительно нужна.')
@@ -541,8 +586,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('--email', default='',
                     help=argparse.SUPPRESS)   # редкий случай: имя ≠ адрес
     sp.add_argument('--purpose', default='', help=argparse.SUPPRESS)
+    sp.add_argument('--readonly', action='store_true',
+                    help='ограничить ящик чтением и черновиками')
     sp.add_argument('--with-send', action='store_true',
-                    help='дать право ОТПРАВКИ (по умолчанию только черновики)')
+                    help='с --readonly: добавить право отправки почты')
     sp.add_argument('--force', action='store_true', help='перезаписать существующий')
     sp.add_argument('--paste', action='store_true',
                     help='браузер на другой машине: вставить адрес с кодом вручную')
