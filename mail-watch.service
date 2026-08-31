@@ -15,6 +15,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=MAIL_WATCH_INTERVAL=120
 Environment=MAIL_WATCH_TOKEN_FILE=/home/nklyuchnikov/.config/agent_gmail/bot_token.txt
 Environment=MAIL_WATCH_MYSQL_CONFIG=/home/nklyuchnikov/.config/agent_gmail/mysql.json
+Environment=MAIL_WATCH_PEER_SCRIPT=/home/nklyuchnikov/PycharmProjects/some_codex/bot_workspace/scripts/peer.py
 Environment=MAIL_WATCH_SCHEMA_MIGRATE=0
 UMask=0077
 ExecStartPre=/usr/bin/test -r /home/nklyuchnikov/.config/agent_gmail/bot_token.txt

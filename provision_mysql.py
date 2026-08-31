@@ -16,6 +16,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -147,6 +148,25 @@ def _secret_write(path: Path, content: str) -> None:
             pass
 
 
+@contextmanager
+def _temporary_migration_grants(admin, account: str, database_ident: str):
+    """Grant schema DDL only inside the migration and always restore DML."""
+    try:
+        with admin.cursor() as cursor:
+            _revoke_current_grants(cursor, account)
+            cursor.execute(
+                "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, "
+                f"REFERENCES ON {database_ident}.* TO {account}"
+            )
+        yield
+    finally:
+        with admin.cursor() as cursor:
+            _revoke_current_grants(cursor, account)
+            cursor.execute(
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON {database_ident}.* TO {account}"
+            )
+
+
 def provision(args: argparse.Namespace) -> int:
     for label, value in (("database", args.database), ("user", args.user)):
         if not re.fullmatch(r"[A-Za-z0-9_]+", value):
@@ -257,39 +277,29 @@ def provision(args: argparse.Namespace) -> int:
         account = f"'{args.user}'@'%'"
         database_ident = f"`{args.database}`"
         try:
-            with admin.cursor() as cursor:
-                _revoke_current_grants(cursor, account)
-                cursor.execute(
-                    "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, "
-                    f"REFERENCES ON {database_ident}.* TO {account}"
+            with _temporary_migration_grants(admin, account, database_ident):
+                config = {
+                    "cluster_id": cid,
+                    "cluster_name": args.cluster,
+                    "host": connection["host"],
+                    "port": int(connection["port"]),
+                    "user": args.user,
+                    "password": password,
+                    "database": args.database,
+                    "ca": str(ca_path),
+                }
+                temp_config = config_path.with_suffix(config_path.suffix + ".provisioning")
+                _secret_write(
+                    temp_config, json.dumps(config, ensure_ascii=False, indent=2) + "\n"
                 )
-
-            config = {
-                "cluster_id": cid,
-                "cluster_name": args.cluster,
-                "host": connection["host"],
-                "port": int(connection["port"]),
-                "user": args.user,
-                "password": password,
-                "database": args.database,
-                "ca": str(ca_path),
-            }
-            temp_config = config_path.with_suffix(config_path.suffix + ".provisioning")
-            _secret_write(
-                temp_config, json.dumps(config, ensure_ascii=False, indent=2) + "\n"
-            )
-            try:
-                from mail_store import MailStore
-                migrated = MailStore(temp_config, migrate=True)
-                migrated.close()
-            finally:
-                temp_config.unlink(missing_ok=True)
+                try:
+                    from mail_store import MailStore
+                    migrated = MailStore(temp_config, migrate=True)
+                    migrated.close()
+                finally:
+                    temp_config.unlink(missing_ok=True)
 
             with admin.cursor() as cursor:
-                _revoke_current_grants(cursor, account)
-                cursor.execute(
-                    f"GRANT SELECT, INSERT, UPDATE, DELETE ON {database_ident}.* TO {account}"
-                )
                 cursor.execute(f"SHOW GRANTS FOR {account}")
                 grants = [str(row[0]) for row in cursor.fetchall()]
         finally:

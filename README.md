@@ -13,6 +13,13 @@
 Оба агента (`some` и `some_codex`) видят `gmail_tool.py` через симлинки. Worker
 самостоятелен и продолжает следить за почтой, даже когда агенты выключены.
 
+Для Клоди есть отдельная durable-подписка, не зависящая от категории Никиты.
+Из `business@ddinsights.org` ей через peer bus приходят события CrazyGames,
+Google Play и любые человеческие входящие ответы площадок. Событие содержит
+только mailbox, gmail_id, sender, subject и topic; тело Клоди при необходимости
+читает сама через `gmail_tool.py read`. Доставка at-least-once, дедупликация —
+по gmail_id.
+
 ## Что видит Никита
 
 Срочные и важные письма приходят отдельными обычными Telegram-уведомлениями.
@@ -53,6 +60,13 @@
 3. Отдельно подтягиваются только метаданные, затем классификация.
 4. Только успешный `sendMessage` помечает письмо доставленным.
 5. Любая ошибка оставляет запись в очереди для следующей попытки.
+6. Релевантные Клоди письма получают независимую subscriber-outbox; её ack
+   ставится только после успешного `peer.py tell`.
+
+Папки Spam и Trash не опрашиваются. Кроме фильтров Gmail, worker повторно
+требует текущую метку Inbox и отсутствие Spam/Trash/Draft/Sent при получении
+metadata. Не прошедшие этот барьер письма fail-closed отбрасываются до
+классификации и любых subscriber-событий.
 
 Если MySQL недоступен, Gmail-cursor не продвигается. Если Telegram недоступен,
 письмо уже лежит в outbox. При неоднозначном сетевом таймауте возможен редкий
@@ -179,6 +193,7 @@ MAIL_WATCH_INTEGRATION=1 \
 | `MAIL_WATCH_CONFIDENCE_FLOOR` | `0.72` |
 | `MAIL_WATCH_MYSQL_CONFIG` | `~/.config/agent_gmail/mysql.json` |
 | `MAIL_WATCH_TOKEN_FILE` | `~/.config/agent_gmail/bot_token.txt` |
+| `MAIL_WATCH_PEER_SCRIPT` | `some_codex/bot_workspace/scripts/peer.py` |
 
 ## Граница для игр
 

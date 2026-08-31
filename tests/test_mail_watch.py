@@ -15,6 +15,9 @@ class FakeStore:
         self.feedback = []
         self.promotions = []
         self.suppressed = []
+        self.subscriber_queued = []
+        self.subscriber_delivered = []
+        self.subscriber_errors = []
         self.meta = {"chat_id": "42", "owner_user_id": "42"}
 
     def get_meta(self, key, default=None):
@@ -64,8 +67,43 @@ class FakeStore:
                     classifier_source=source,
                 )
 
+    def finalize_classification(
+        self,
+        token,
+        category,
+        confidence,
+        why,
+        source,
+        *,
+        suppress=False,
+        subscriber=None,
+        topic=None,
+    ):
+        self.set_classification(token, category, confidence, why, source)
+        if suppress:
+            self.mark_suppressed(token)
+        if subscriber and topic:
+            return self.enqueue_subscriber(token, subscriber, topic)
+        return False
+
     def mark_suppressed(self, token):
         self.suppressed.append(token)
+
+    def enqueue_subscriber(self, token, subscriber, topic):
+        self.subscriber_queued.append((token, subscriber, topic))
+        return True
+
+    def pending_subscriber(self, subscriber, limit):
+        return [
+            row for row in self.items
+            if row.get("subscriber") == subscriber
+        ][:limit]
+
+    def mark_subscriber_delivered(self, delivery_id):
+        self.subscriber_delivered.append(delivery_id)
+
+    def record_subscriber_error(self, delivery_id, error):
+        self.subscriber_errors.append((delivery_id, error))
 
     def set_meta(self, key, value):
         self.meta[key] = value
@@ -149,6 +187,24 @@ class ClassifierTests(unittest.TestCase):
         store = FakeStore([row])
         self.assertEqual(mw._classify_pending(store, {}), 1)
         self.assertEqual(store.suppressed, [row["token"]])
+
+    @mock.patch("mail_watch._classify_batch")
+    def test_crazygames_noise_is_still_enqueued_for_claude(self, classify):
+        row = item(
+            category=None,
+            mailbox="business@ddinsights.org",
+            sender_email="no-reply@crazygames.com",
+            subject="Crosswise is live on CrazyGames",
+        )
+        classify.return_value = [
+            {**row, "category": "routine", "confidence": .95, "why": "status", "source": "opus"}
+        ]
+        store = FakeStore([row])
+        mw._classify_pending(store, {})
+        self.assertEqual(
+            store.subscriber_queued,
+            [(row["token"], "claude", "crazygames")],
+        )
 
     @mock.patch("mail_watch.subprocess.run")
     def test_classifier_is_toolless_ephemeral_and_prompt_uses_stdin(self, run):
@@ -239,8 +295,151 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(store.promotions, [])
         self.assertEqual(store.errors[0][0], promoted["token"])
 
+    @mock.patch("mail_watch._peer_tell")
+    def test_subscriber_ack_happens_only_after_peer_delivery(self, tell):
+        event = item(
+            subscriber="claude",
+            subscriber_delivery_id=9,
+            topic="crazygames",
+        )
+        store = FakeStore([event])
+        self.assertEqual(mw._deliver_subscriber(store, "claude"), 1)
+        self.assertEqual(store.subscriber_delivered, [9])
+        self.assertIn("[mail-watch]", tell.call_args.args[1])
+        self.assertIn('"gmail_id": "abc"', tell.call_args.args[1])
+
+    @mock.patch("mail_watch._peer_tell", side_effect=RuntimeError("offline"))
+    def test_failed_subscriber_delivery_stays_pending(self, _tell):
+        event = item(
+            subscriber="claude",
+            subscriber_delivery_id=9,
+            topic="google-play",
+        )
+        store = FakeStore([event])
+        self.assertEqual(mw._deliver_subscriber(store, "claude"), 0)
+        self.assertEqual(store.subscriber_delivered, [])
+        self.assertEqual(store.subscriber_errors[0][0], 9)
+
+    @mock.patch("mail_watch.subprocess.run")
+    def test_peer_delivery_uses_stdin_and_explicit_codex_identity(self, run):
+        run.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
+        secret = "subject metadata must stay off argv"
+        mw._peer_tell("claude", secret)
+        argv = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        self.assertEqual(argv[-3:], ["tell", "claude", "-"])
+        self.assertNotIn(secret, argv)
+        self.assertEqual(kwargs["input"], secret)
+        self.assertEqual(kwargs["env"]["PEER_SELF"], "codex")
+        self.assertEqual(kwargs["timeout"], 150)
+
+
+class SubscriberFilterTests(unittest.TestCase):
+    def test_platform_and_human_business_mail(self):
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="no-reply@crazygames.com",
+                subject="Crosswise is live",
+            )),
+            "crazygames",
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="googleplay-developer-support@google.com",
+                subject="Re: case 123",
+            )),
+            "google-play",
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="editor@gameportal.example",
+                subject="Your game review",
+                mailing_list=0,
+            )),
+            "outreach-reply",
+        )
+
+    def test_automation_and_other_mailboxes_do_not_leak(self):
+        self.assertIsNone(mw._claude_subscription_topic(item(
+            mailbox="business@ddinsights.org",
+            sender_email="notifications@producthunt.com",
+            subject="Daily digest",
+            mailing_list=0,
+        )))
+        self.assertIsNone(mw._claude_subscription_topic(item(
+            mailbox="personal@example.com",
+            sender_email="human@gameportal.example",
+            subject="Hello",
+            mailing_list=0,
+        )))
+        self.assertIsNone(mw._claude_subscription_topic(item(
+            mailbox="business@ddinsights.org",
+            sender_email="no-reply@crazygames.com",
+            subject="Crosswise is live",
+            gmail_labels='["SPAM"]',
+        )))
+
 
 class GmailRecoveryTests(unittest.TestCase):
+    def test_spam_and_trash_labels_are_fail_closed(self):
+        self.assertTrue(mw._safe_inbound_labels(["INBOX", "IMPORTANT"]))
+        self.assertFalse(mw._safe_inbound_labels(["INBOX", "SPAM"]))
+        self.assertFalse(mw._safe_inbound_labels(["TRASH"]))
+
+    @mock.patch("mail_watch.gt._service")
+    def test_spam_discovered_before_hydration_never_gets_metadata(self, service_factory):
+        service = mock.MagicMock()
+        service_factory.return_value = service
+        service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+            "id": "abc",
+            "labelIds": ["SPAM"],
+            "payload": {"headers": []},
+        }
+        store = FakeStore([item(sender=None)])
+        store.unhydrated = lambda limit: store.items
+        store.set_metadata = mock.Mock()
+        store.record_metadata_error = mock.Mock()
+
+        self.assertEqual(mw._hydrate_pending(store), 0)
+        store.set_metadata.assert_not_called()
+        store.record_metadata_error.assert_called_once_with(
+            store.items[0]["token"],
+            "ignored Gmail folder labels: SPAM",
+            permanent=True,
+        )
+
+    def test_cold_start_query_explicitly_excludes_spam_and_trash(self):
+        service = mock.MagicMock()
+        service.users.return_value.messages.return_value.list.return_value.execute.return_value = {}
+        self.assertEqual(mw._list_recent_ids(service, 1, 10), [])
+        kwargs = service.users.return_value.messages.return_value.list.call_args.kwargs
+        self.assertIn("-in:spam", kwargs["q"])
+        self.assertIn("-in:trash", kwargs["q"])
+        self.assertFalse(kwargs["includeSpamTrash"])
+
+    @mock.patch("mail_watch.gt._service")
+    def test_incremental_history_accepts_message_when_labels_are_omitted(
+        self, service_factory
+    ):
+        service = mock.MagicMock()
+        service_factory.return_value = service
+        service.users.return_value.getProfile.return_value.execute.return_value = {
+            "historyId": "h2"
+        }
+        service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+            "historyId": "h2",
+            "history": [{"messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}]}],
+        }
+        store = mock.MagicMock()
+        store.mailbox_cursor.return_value = "h1"
+        store.stage_discovery.return_value = 1
+        self.assertEqual(mw._discover_mailbox("box@example.com", store), 1)
+        staged = store.stage_discovery.call_args.args
+        self.assertEqual(staged, ("box@example.com", "h2", ["m1"]))
+
     def test_full_sync_reads_every_page_without_limit(self):
         service = mock.MagicMock()
         execute = service.users.return_value.messages.return_value.list.return_value.execute

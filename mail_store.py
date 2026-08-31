@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_CONFIG = Path.home() / ".config/agent_gmail/mysql.json"
 
 
@@ -210,6 +210,22 @@ class MailStore:
                 chosen_category VARCHAR(16) NOT NULL,
                 created_at BIGINT NOT NULL,
                 CONSTRAINT fk_feedback_message FOREIGN KEY(token)
+                    REFERENCES messages(token)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS subscriber_deliveries (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                subscriber VARCHAR(64) NOT NULL,
+                token CHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                topic VARCHAR(64) NOT NULL,
+                queued_at BIGINT NOT NULL,
+                delivered_at BIGINT,
+                delivery_attempts INT NOT NULL DEFAULT 0,
+                last_error VARCHAR(1000),
+                UNIQUE KEY uq_subscriber_message (subscriber, token),
+                KEY idx_subscriber_pending (subscriber, delivered_at, queued_at),
+                CONSTRAINT fk_subscriber_message FOREIGN KEY(token)
                     REFERENCES messages(token)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
@@ -462,13 +478,57 @@ class MailStore:
         *,
         now: int | None = None,
     ) -> None:
+        self.finalize_classification(
+            token,
+            category,
+            confidence,
+            why,
+            source,
+            now=now,
+        )
+
+    def finalize_classification(
+        self,
+        token: str,
+        category: str,
+        confidence: float,
+        why: str,
+        source: str,
+        *,
+        suppress: bool = False,
+        subscriber: str | None = None,
+        topic: str | None = None,
+        now: int | None = None,
+    ) -> bool:
+        """Commit classification, suppression and subscriber enqueue atomically."""
+        if bool(subscriber) != bool(topic):
+            raise ValueError("subscriber and topic must be provided together")
+        when = int(now or time.time())
         with self._tx() as cursor:
             cursor.execute(
                 "UPDATE messages SET category = %s, confidence = %s, why = %s, "
                 "classifier_source = %s, classified_at = %s, last_error = NULL "
                 "WHERE token = %s",
-                (category, confidence, why[:1000], source, int(now or time.time()), token),
+                (category, confidence, why[:1000], source, when, token),
             )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"message token not found: {token}")
+            if suppress:
+                cursor.execute(
+                    "UPDATE messages SET delivered_at = %s, "
+                    "delivery_kind = 'suppressed', telegram_message_id = NULL, "
+                    "last_error = NULL WHERE token = %s",
+                    (when, token),
+                )
+            subscriber_enqueued = False
+            if subscriber and topic:
+                cursor.execute(
+                    "INSERT IGNORE INTO subscriber_deliveries("
+                    "subscriber, token, topic, queued_at) VALUES(%s, %s, %s, %s)",
+                    (subscriber[:64], token, topic[:64], when),
+                )
+                subscriber_enqueued = bool(cursor.rowcount)
+            return subscriber_enqueued
 
     def pending_hot(self, confidence_floor: float, limit: int = 25) -> list[dict]:
         return self._fetchall(
@@ -589,6 +649,51 @@ class MailStore:
             (limit,),
         )
 
+    def enqueue_subscriber(
+        self,
+        token: str,
+        subscriber: str,
+        topic: str,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        with self._tx() as cursor:
+            cursor.execute(
+                "INSERT IGNORE INTO subscriber_deliveries("
+                "subscriber, token, topic, queued_at) VALUES(%s, %s, %s, %s)",
+                (subscriber[:64], token, topic[:64], int(now or time.time())),
+            )
+            return bool(cursor.rowcount)
+
+    def pending_subscriber(self, subscriber: str, limit: int = 25) -> list[dict]:
+        return self._fetchall(
+            "SELECT d.id AS subscriber_delivery_id, d.subscriber, d.topic, "
+            "d.queued_at AS subscriber_queued_at, d.delivery_attempts AS subscriber_attempts, "
+            "m.* FROM subscriber_deliveries d JOIN messages m ON m.token = d.token "
+            "WHERE d.subscriber = %s AND d.delivered_at IS NULL "
+            "ORDER BY d.queued_at, d.id LIMIT %s",
+            (subscriber, limit),
+        )
+
+    def mark_subscriber_delivered(
+        self, delivery_id: int, *, now: int | None = None
+    ) -> None:
+        with self._tx() as cursor:
+            cursor.execute(
+                "UPDATE subscriber_deliveries SET delivered_at = %s, "
+                "delivery_attempts = delivery_attempts + 1, last_error = NULL "
+                "WHERE id = %s",
+                (int(now or time.time()), delivery_id),
+            )
+
+    def record_subscriber_error(self, delivery_id: int, error: str) -> None:
+        with self._tx() as cursor:
+            cursor.execute(
+                "UPDATE subscriber_deliveries SET delivery_attempts = delivery_attempts + 1, "
+                "last_error = %s WHERE id = %s",
+                (error[:1000], delivery_id),
+            )
+
     def recent(self, limit: int = 12) -> list[dict]:
         return self._fetchall(
             "SELECT * FROM messages WHERE category IS NOT NULL "
@@ -614,6 +719,10 @@ class MailStore:
             "SELECT COUNT(*) AS n FROM mailbox_state WHERE history_id IS NOT NULL"
         ) or {"n": 0}
         out["mailboxes"] = int(boxes["n"])
+        pending = self._fetchone(
+            "SELECT COUNT(*) AS n FROM subscriber_deliveries WHERE delivered_at IS NULL"
+        ) or {"n": 0}
+        out["subscriber_pending"] = int(pending["n"])
         return out
 
     def mailbox_status(self) -> list[dict]:

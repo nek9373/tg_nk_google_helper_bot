@@ -14,6 +14,10 @@ class MailStoreIntegrationTests(unittest.TestCase):
     def tearDown(self):
         with self.store._tx() as cursor:
             cursor.execute(
+                "DELETE d FROM subscriber_deliveries d JOIN messages m ON d.token=m.token "
+                "WHERE m.mailbox=%s", (self.mailbox,)
+            )
+            cursor.execute(
                 "DELETE f FROM feedback f JOIN messages m ON f.token=m.token "
                 "WHERE m.mailbox=%s", (self.mailbox,)
             )
@@ -62,6 +66,24 @@ class MailStoreIntegrationTests(unittest.TestCase):
         )
         self.store.mark_promotion_delivered(target["token"], 88, now=106)
         self.assertEqual(self.store.pending_promotions(10), [])
+
+        self.assertTrue(self.store.finalize_classification(
+            target["token"], "routine", 0.95, "status", "unit",
+            suppress=True, subscriber="claude", topic="crazygames", now=107,
+        ))
+        self.assertFalse(
+            self.store.finalize_classification(
+                target["token"], "routine", 0.95, "status", "unit",
+                suppress=True, subscriber="claude", topic="crazygames", now=108,
+            )
+        )
+        self.assertEqual(
+            self.store.get_message(target["token"])["delivery_kind"], "suppressed"
+        )
+        pending = self.store.pending_subscriber("claude", 10)
+        self.assertEqual([row["token"] for row in pending], [target["token"]])
+        self.store.mark_subscriber_delivered(pending[0]["subscriber_delivery_id"], now=109)
+        self.assertEqual(self.store.pending_subscriber("claude", 10), [])
 
     def test_dead_letter_backoff_rename_and_global_lease(self):
         self.store.stage_discovery(self.mailbox, "h200", ["dead", "retry"], now=200)
