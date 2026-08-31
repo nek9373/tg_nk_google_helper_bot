@@ -71,13 +71,16 @@ mail_watch.py run          # цикл (systemd)
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install requests google-api-python-client \
-    google-auth-httplib2 google-auth-oauthlib
+.venv/bin/pip install -r requirements.txt
 
 # секрет OAuth-клиента из Google Cloud
 mkdir -p ~/.config/agent_gmail/tokens && chmod 700 ~/.config/agent_gmail
 cp <client_secret>.json ~/.config/agent_gmail/client_secret.json
 chmod 600 ~/.config/agent_gmail/client_secret.json
+
+# токен Telegram-бота
+echo '<токен от BotFather>' > ~/.config/agent_gmail/bot_token.txt
+chmod 600 ~/.config/agent_gmail/bot_token.txt
 
 cp mail-watch.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now mail-watch
@@ -91,14 +94,10 @@ systemctl --user daemon-reload && systemctl --user enable --now mail-watch
 | токены ящиков | `~/.config/agent_gmail/tokens/<адрес>.json` |
 | назначения ящиков | `~/.config/agent_gmail/mailboxes.json` |
 | состояние воркера | `~/.config/agent_gmail/watch_state.json` |
-| токен Telegram-бота | `/tmp/bot_api.txt` |
+| токен Telegram-бота | `~/.config/agent_gmail/bot_token.txt` |
 
-В репозиторий не попадает ничего из этого.
-
-**Токен Telegram лежит в `/tmp`** — переживёт работу, но не перезагрузку.
-Если воркер после ребута жалуется, что не нашёл токен, положите файл
-заново или перенесите его в `~/.config/agent_gmail/` и укажите путь через
-`MAIL_WATCH_TOKEN_FILE`.
+В репозиторий не попадает ничего из этого. Файл токена держите с правами
+`600`: он даёт полный контроль над ботом.
 
 ## Настройки через окружение
 
@@ -106,7 +105,7 @@ systemctl --user daemon-reload && systemctl --user enable --now mail-watch
 |---|---|
 | `MAIL_WATCH_INTERVAL` | `120` секунд между проходами |
 | `MAIL_WATCH_MODEL` | `claude-opus-5` |
-| `MAIL_WATCH_TOKEN_FILE` | `/tmp/bot_api.txt` |
+| `MAIL_WATCH_TOKEN_FILE` | `~/.config/agent_gmail/bot_token.txt` |
 | `GMAIL_TOKENS_DIR` | `~/.config/agent_gmail/tokens` |
 
 ## Как это связано с остальным
