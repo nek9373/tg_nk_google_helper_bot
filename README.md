@@ -1,0 +1,102 @@
+# mailwatch — почта для агентов
+
+Два инструмента вокруг Gmail: доступ к нескольким ящикам и воркер, который
+следит за входящими и шлёт важное в Telegram.
+
+Отдельный проект, потому что это самостоятельный сервис: свой venv, свой
+systemd-юнит, своё состояние. Раньше жил в `bots_bus`, но тот про
+координацию двух ботов, а почта к ней отношения не имеет. Заодно ушла
+зависимость от venv проекта `some` — обновление зависимостей там больше
+не может сломать почту.
+
+Оба бота (`../some`, `../some_codex`) видят инструменты через симлинки в
+своих `bot_workspace/scripts/`.
+
+## gmail_tool.py — доступ к ящикам
+
+Имя ящика = сам адрес: в одном домене их бывает несколько.
+
+```bash
+gmail_tool.py add me@company.com                  # подключить
+gmail_tool.py add a@x.com b@y.com                 # пачкой, подряд
+gmail_tool.py add me@company.com --with-send      # + право отправки
+gmail_tool.py add me@company.com --paste          # браузер на другой машине
+
+gmail_tool.py list                                # ящики и назначение
+gmail_tool.py search me@company.com "is:unread" -n 5 --snippet
+gmail_tool.py read me@company.com <id>
+gmail_tool.py draft me@company.com --to a@b.c --subject "Т" --body -
+gmail_tool.py describe me@company.com --purpose "для чего ящик"
+gmail_tool.py rename старое новое
+gmail_tool.py revoke me@company.com
+```
+
+Права по умолчанию — чтение и черновики. Отправка только с `--with-send`,
+и каждый `send` требует ещё и `--yes`: письмо не отзывается, а агент
+ошибается молча.
+
+## mail_watch.py — воркер входящей почты
+
+```bash
+mail_watch.py discover     # найти chat_id: написать боту и запустить
+mail_watch.py once         # один проход, для проверки
+mail_watch.py status       # какие ящики под наблюдением
+mail_watch.py run          # цикл (systemd)
+```
+
+Вебхуки не используются. У Gmail push есть (`users.watch` + Cloud Pub/Sub),
+но ему нужен проект в Cloud, топик, подписка и живой endpoint. Опрос по
+`historyId` дешевле: приходят только изменения с прошлой проверки, а не
+список писем.
+
+Первый проход по ящику лишь запоминает точку отсчёта — иначе воркер вывалил
+бы в Telegram всю накопленную почту. Протухший `historyId` (Gmail хранит
+историю около недели) молча заменяется текущим.
+
+Сортировка: отправитель и тема уходят в `claude-opus-5`, **тело письма
+машину не покидает**. `urgent` и `important` идут отдельными сообщениями,
+`routine` и `noise` — строкой дайджеста, не больше 8 уведомлений за проход.
+Классификатор недоступен — всё считается `important`: лишнее уведомление
+лучше пропущенного письма.
+
+## Установка
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install requests google-api-python-client \
+    google-auth-httplib2 google-auth-oauthlib
+
+# секрет OAuth-клиента из Google Cloud
+mkdir -p ~/.config/agent_gmail/tokens && chmod 700 ~/.config/agent_gmail
+cp <client_secret>.json ~/.config/agent_gmail/client_secret.json
+chmod 600 ~/.config/agent_gmail/client_secret.json
+
+cp mail-watch.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now mail-watch
+```
+
+## Где что лежит
+
+| | |
+|---|---|
+| секрет клиента | `~/.config/agent_gmail/client_secret.json` |
+| токены ящиков | `~/.config/agent_gmail/tokens/<адрес>.json` |
+| назначения ящиков | `~/.config/agent_gmail/mailboxes.json` |
+| состояние воркера | `~/.config/agent_gmail/watch_state.json` |
+| токен Telegram-бота | `/tmp/bot_api.txt` |
+
+В репозиторий не попадает ничего из этого.
+
+**Токен Telegram лежит в `/tmp`** — переживёт работу, но не перезагрузку.
+Если воркер после ребута жалуется, что не нашёл токен, положите файл
+заново или перенесите его в `~/.config/agent_gmail/` и укажите путь через
+`MAIL_WATCH_TOKEN_FILE`.
+
+## Настройки через окружение
+
+| переменная | по умолчанию |
+|---|---|
+| `MAIL_WATCH_INTERVAL` | `120` секунд между проходами |
+| `MAIL_WATCH_MODEL` | `claude-opus-5` |
+| `MAIL_WATCH_TOKEN_FILE` | `/tmp/bot_api.txt` |
+| `GMAIL_TOKENS_DIR` | `~/.config/agent_gmail/tokens` |

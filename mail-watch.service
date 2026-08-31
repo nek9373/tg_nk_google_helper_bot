@@ -1,0 +1,21 @@
+[Unit]
+Description=Mail watcher — новые письма, сортировка через Opus 5, уведомления в Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nklyuchnikov/PycharmProjects/mailwatch
+# PATH load-bearing: классификатор зовёт claude из ~/.npm-global/bin
+Environment=PATH=/home/nklyuchnikov/.npm-global/bin:/home/nklyuchnikov/.nvm/versions/node/v22.21.1/bin:/home/nklyuchnikov/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=MAIL_WATCH_INTERVAL=120
+ExecStart=/home/nklyuchnikov/PycharmProjects/mailwatch/.venv/bin/python /home/nklyuchnikov/PycharmProjects/mailwatch/mail_watch.py run
+Restart=always
+RestartSec=30
+# Разовый сбой сети не должен убивать юнит насмерть
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Install]
+WantedBy=default.target
