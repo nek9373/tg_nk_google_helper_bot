@@ -50,7 +50,7 @@ class MailStoreIntegrationTests(unittest.TestCase):
         hot = [row for row in self.store.pending_hot(0.72, 100) if row["mailbox"] == self.mailbox]
         self.assertEqual([row["token"] for row in hot], [target["token"]])
 
-        self.store.mark_delivered(target["token"], "digest", 77, now=103)
+        self.store.mark_suppressed(target["token"], now=103)
         changed, _ = self.store.apply_feedback("callback-1", target["token"], "important", now=104)
         repeated, _ = self.store.apply_feedback("callback-1", target["token"], "important", now=105)
         self.assertTrue(changed)

@@ -51,7 +51,6 @@ CLASSIFY_BATCH = 20
 CLASSIFY_LIMIT = 200
 HYDRATE_LIMIT = 250
 HOT_SEND_LIMIT = 25
-LOW_DIGEST_LIMIT = 8
 CONFIDENCE_FLOOR = float(os.environ.get("MAIL_WATCH_CONFIDENCE_FLOOR", "0.72"))
 COLD_START_DAYS = 1
 COLD_START_LIMIT = 100
@@ -754,6 +753,13 @@ def _classify_pending(store: MailStore, meta: dict) -> int:
                 verdict["why"],
                 verdict["source"],
             )
+            if (
+                verdict["category"] not in NOTIFY
+                and verdict["confidence"] >= CONFIDENCE_FLOOR
+            ):
+                # Confident routine/noise is retained for /recent and learning,
+                # but never interrupts Nikita on its own.
+                store.mark_suppressed(verdict["token"])
             log(
                 f"  {EMOJI[verdict['category']]} {verdict['category']:9} "
                 f"token={verdict['token']}"
@@ -808,41 +814,6 @@ def _deliver_promotions(
     return delivered
 
 
-def _deliver_low_digest(store: MailStore) -> int:
-    items = store.pending_low(CONFIDENCE_FLOOR, LOW_DIGEST_LIMIT)
-    if not items:
-        return 0
-    lines = ["Тихий дайджест — бот пока считает эти письма неважными:"]
-    keyboard = []
-    for index, item in enumerate(items, 1):
-        category = _effective_category(item)
-        lines.append(
-            f"{index}. {EMOJI[category]} {_san(item.get('subject') or '(без темы)', 90)} "
-            f"— {_san(item.get('sender') or '?', 60)}"
-        )
-        keyboard.append(
-            [{"text": f"↑ {index} важное", "callback_data": f"imp:{item['token']}:i"}]
-        )
-    keyboard.append([{"text": "Показать последние", "callback_data": "cmd:recent"}])
-    try:
-        sent = _tg(
-            "sendMessage",
-            chat_id=_chat_id(store),
-            text="\n".join(lines)[:4000],
-            reply_markup={"inline_keyboard": keyboard},
-            disable_notification=True,
-            disable_web_page_preview=True,
-        )
-        for item in items:
-            store.mark_delivered(item["token"], "digest", int(sent["message_id"]))
-        return len(items)
-    except Exception as exc:
-        for item in items:
-            store.record_delivery_error(item["token"], str(exc))
-        log(f"digest остался в очереди: {exc}")
-        return 0
-
-
 def _notify_mailbox_health(store: MailStore) -> None:
     bad = [row for row in store.mailbox_status() if row.get("last_error")]
     signature = ",".join(row["mailbox"] for row in bad)
@@ -887,7 +858,6 @@ def _mail_cycle(store: MailStore) -> dict:
     delivered = (
         _deliver_promotions(store)
         + _deliver_hot(store)
-        + _deliver_low_digest(store)
     )
     store.set_meta("last_cycle_at", str(int(time.time())))
     if successful_scans == len(aliases):

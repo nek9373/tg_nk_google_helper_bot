@@ -14,6 +14,7 @@ class FakeStore:
         self.errors = []
         self.feedback = []
         self.promotions = []
+        self.suppressed = []
         self.meta = {"chat_id": "42", "owner_user_id": "42"}
 
     def get_meta(self, key, default=None):
@@ -46,6 +47,25 @@ class FakeStore:
 
     def mark_promotion_delivered(self, token, message_id):
         self.promotions.append((token, message_id))
+
+    def feedback_examples(self, limit):
+        return []
+
+    def unclassified(self, limit):
+        return [row for row in self.items if row.get("category") is None][:limit]
+
+    def set_classification(self, token, category, confidence, why, source):
+        for row in self.items:
+            if row["token"] == token:
+                row.update(
+                    category=category,
+                    confidence=confidence,
+                    why=why,
+                    classifier_source=source,
+                )
+
+    def mark_suppressed(self, token):
+        self.suppressed.append(token)
 
     def set_meta(self, key, value):
         self.meta[key] = value
@@ -120,6 +140,16 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result[0]["category"], "important")
         self.assertEqual(result[0]["source"], "safety-floor")
 
+    @mock.patch("mail_watch._classify_batch")
+    def test_confident_noise_is_stored_without_telegram_delivery(self, classify):
+        row = item(category=None)
+        classify.return_value = [
+            {**row, "category": "noise", "confidence": .95, "why": "promo", "source": "opus"}
+        ]
+        store = FakeStore([row])
+        self.assertEqual(mw._classify_pending(store, {}), 1)
+        self.assertEqual(store.suppressed, [row["token"]])
+
     @mock.patch("mail_watch.subprocess.run")
     def test_classifier_is_toolless_ephemeral_and_prompt_uses_stdin(self, run):
         run.return_value = mock.Mock(
@@ -175,10 +205,11 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(store.delivered, [("0123456789abcdef", "hot", 77)])
 
     @mock.patch("mail_watch._tg", return_value={"message_id": 88})
-    def test_low_digest_exposes_subject_and_promotion_button(self, tg):
+    def test_recent_exposes_suppressed_subject_and_promotion_button(self, tg):
         low = item(category="routine", confidence=0.9, subject="Weekly status")
         store = FakeStore([low])
-        self.assertEqual(mw._deliver_low_digest(store), 1)
+        store.recent = lambda limit: store.items[:limit]
+        mw._send_recent(store)
         params = tg.call_args.kwargs
         self.assertIn("Weekly status", params["text"])
         callback = params["reply_markup"]["inline_keyboard"][0][0]["callback_data"]

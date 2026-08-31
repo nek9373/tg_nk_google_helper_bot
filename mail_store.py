@@ -488,6 +488,15 @@ class MailStore:
             (confidence_floor, limit),
         )
 
+    def mark_suppressed(self, token: str, *, now: int | None = None) -> None:
+        """Acknowledge a confident low-priority item without sending Telegram."""
+        with self._tx() as cursor:
+            cursor.execute(
+                "UPDATE messages SET delivered_at = %s, delivery_kind = 'suppressed', "
+                "telegram_message_id = NULL, last_error = NULL WHERE token = %s",
+                (int(now or time.time()), token),
+            )
+
     def pending_promotions(
         self, limit: int = 25, *, token: str | None = None
     ) -> list[dict]:
@@ -561,7 +570,7 @@ class MailStore:
                 return False, row
             promotion_pending = bool(
                 chosen_category in ("urgent", "important")
-                and row.get("delivery_kind") == "digest"
+                and row.get("delivery_kind") in ("digest", "suppressed")
             )
             cursor.execute(
                 "UPDATE messages SET user_category = %s, feedback_at = %s, "
