@@ -14,11 +14,12 @@
 самостоятелен и продолжает следить за почтой, даже когда агенты выключены.
 
 Для Клоди есть отдельная durable-подписка, не зависящая от категории Никиты.
-Из `business@ddinsights.org` ей через peer bus приходят события CrazyGames,
-Google Play и любые человеческие входящие ответы площадок. Событие содержит
-только mailbox, gmail_id, sender, subject и topic; тело Клоди при необходимости
-читает сама через `gmail_tool.py read`. Доставка at-least-once, дедупликация —
-по gmail_id.
+Из `business@ddinsights.org` ей через peer bus приходят уведомления платформ
+(`platform-notice` для автоматических Snapchat/Google/CrazyGames), отдельные
+события CrazyGames и Google Play, а также любые человеческие входящие ответы
+площадок. Событие содержит только mailbox, gmail_id, sender, subject и topic;
+тело Клоди при необходимости читает сама через `gmail_tool.py read`. Доставка
+at-least-once, дедупликация — по gmail_id.
 
 ## Что видит Никита
 

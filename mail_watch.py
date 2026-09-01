@@ -821,6 +821,21 @@ def _claude_subscription_topic(item: dict) -> str | None:
         return None
     sender = (item.get("sender_email") or "").lower()
     subject = (item.get("subject") or "").lower()
+    local_part, separator, domain = sender.partition("@")
+    automated_sender = any(
+        marker in local_part
+        for marker in ("no-reply", "noreply", "notification", "notifications")
+    )
+    platform_notice = (
+        sender == "snap-ads-receipts-cc@snapchat.com"
+        or (
+            bool(separator)
+            and domain in {"snapchat.com", "google.com", "crazygames.com"}
+            and automated_sender
+        )
+    )
+    if platform_notice:
+        return "platform-notice"
     if sender.endswith("@crazygames.com") or "crazygames" in subject:
         return "crazygames"
     if (
@@ -831,11 +846,6 @@ def _claude_subscription_topic(item: dict) -> str | None:
         or "google play" in subject
     ):
         return "google-play"
-    local_part = sender.split("@", 1)[0]
-    automated_sender = any(
-        marker in local_part
-        for marker in ("no-reply", "noreply", "notification", "notifications")
-    )
     if (
         not item.get("mailing_list")
         and not automated_sender

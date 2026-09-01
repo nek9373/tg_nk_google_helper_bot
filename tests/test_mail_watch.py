@@ -189,7 +189,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(store.suppressed, [row["token"]])
 
     @mock.patch("mail_watch._classify_batch")
-    def test_crazygames_noise_is_still_enqueued_for_claude(self, classify):
+    def test_crazygames_platform_notice_is_still_enqueued_for_claude(self, classify):
         row = item(
             category=None,
             mailbox="business@ddinsights.org",
@@ -203,7 +203,7 @@ class ClassifierTests(unittest.TestCase):
         mw._classify_pending(store, {})
         self.assertEqual(
             store.subscriber_queued,
-            [(row["token"], "claude", "crazygames")],
+            [(row["token"], "claude", "platform-notice")],
         )
 
     @mock.patch("mail_watch.subprocess.run")
@@ -342,7 +342,31 @@ class SubscriberFilterTests(unittest.TestCase):
                 sender_email="no-reply@crazygames.com",
                 subject="Crosswise is live",
             )),
-            "crazygames",
+            "platform-notice",
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="googleplay-noreply@google.com",
+                subject="Your production release is live",
+            )),
+            "platform-notice",
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="snap-ads-receipts-cc@snapchat.com",
+                subject="How you are going to be charged",
+            )),
+            "platform-notice",
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="ad-api-notifications@snapchat.com",
+                subject="Your ad has been approved",
+            )),
+            "platform-notice",
         )
         self.assertEqual(
             mw._claude_subscription_topic(item(
@@ -351,6 +375,23 @@ class SubscriberFilterTests(unittest.TestCase):
                 subject="Re: case 123",
             )),
             "google-play",
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="editor@crazygames.com",
+                subject="Re: Crosswise release",
+            )),
+            "crazygames",
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="partner@snapchat.com",
+                subject="Re: your campaign",
+                mailing_list=0,
+            )),
+            "outreach-reply",
         )
         self.assertEqual(
             mw._claude_subscription_topic(item(
@@ -367,6 +408,12 @@ class SubscriberFilterTests(unittest.TestCase):
             mailbox="business@ddinsights.org",
             sender_email="notifications@producthunt.com",
             subject="Daily digest",
+            mailing_list=0,
+        )))
+        self.assertIsNone(mw._claude_subscription_topic(item(
+            mailbox="business@ddinsights.org",
+            sender_email="no-reply@snapchat.example",
+            subject="Billing notice",
             mailing_list=0,
         )))
         self.assertIsNone(mw._claude_subscription_topic(item(
