@@ -371,6 +371,22 @@ class SubscriberFilterTests(unittest.TestCase):
         self.assertEqual(
             mw._claude_subscription_topic(item(
                 mailbox="business@ddinsights.org",
+                sender_email="support@digitalocean.com",
+                subject="Your DigitalOcean invoice is available",
+            )),
+            "platform-notice",
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="support@digitalocean.com",
+                subject="Payment received",
+            )),
+            "platform-notice",
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
                 sender_email="googleplay-developer-support@google.com",
                 subject="Re: case 123",
             )),

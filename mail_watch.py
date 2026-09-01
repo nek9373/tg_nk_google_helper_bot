@@ -827,10 +827,15 @@ def _claude_subscription_topic(item: dict) -> str | None:
         for marker in ("no-reply", "noreply", "notification", "notifications")
     )
     platform_notice = (
-        sender == "snap-ads-receipts-cc@snapchat.com"
+        sender in {
+            "snap-ads-receipts-cc@snapchat.com",
+            "support@digitalocean.com",
+        }
         or (
             bool(separator)
-            and domain in {"snapchat.com", "google.com", "crazygames.com"}
+            and domain in {
+                "snapchat.com", "google.com", "crazygames.com", "digitalocean.com",
+            }
             and automated_sender
         )
     )
