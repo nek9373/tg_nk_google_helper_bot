@@ -178,6 +178,101 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result[0]["category"], "important")
         self.assertEqual(result[0]["source"], "safety-floor")
 
+    @mock.patch("mail_watch.subprocess.run")
+    def test_google_ads_owner_rule_depends_on_mailbox(self, run):
+        verdicts = [
+            {"i": 1, "category": "urgent", "confidence": .99, "why": "model high"},
+            {"i": 2, "category": "noise", "confidence": .99, "why": "model low"},
+            {"i": 3, "category": "noise", "confidence": .91, "why": "model scoped"},
+        ]
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps(verdicts),
+            stderr="",
+        )
+        sender = "ads-account-noreply@ads.google.com"
+        rows = mw._classify_batch(
+            [
+                item(mailbox="nk@eoworking.com", sender_email=sender, category=None),
+                item(mailbox="business@ddinsights.org", sender_email=sender, category=None),
+                item(mailbox="other@example.com", sender_email=sender, category=None),
+            ],
+            [],
+            {},
+        )
+        self.assertEqual(
+            [(row["category"], row["confidence"], row["source"]) for row in rows],
+            [
+                ("routine", 1.0, "owner-rule"),
+                ("important", 1.0, "owner-rule"),
+                ("noise", .91, "opus"),
+            ],
+        )
+
+    @mock.patch("mail_watch.subprocess.run")
+    def test_google_ads_owner_rule_does_not_hide_safety_subject(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps(
+                [{"i": 1, "category": "noise", "confidence": .99, "why": "auto"}]
+            ),
+            stderr="",
+        )
+        row = item(
+            mailbox="nk@eoworking.com",
+            sender_email="ads-account-noreply@ads.google.com",
+            subject="Payment failed",
+            category=None,
+        )
+        result = mw._classify_batch([row], [], {})
+        self.assertEqual(result[0]["category"], "important")
+        self.assertEqual(result[0]["source"], "safety-floor")
+
+    @mock.patch("mail_watch.subprocess.run")
+    def test_google_ads_routine_is_suppressed(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps(
+                [{"i": 1, "category": "urgent", "confidence": .99, "why": "model"}]
+            ),
+            stderr="",
+        )
+        row = item(
+            category=None,
+            mailbox="nk@eoworking.com",
+            sender_email="ads-account-noreply@ads.google.com",
+        )
+        store = FakeStore([row])
+        self.assertEqual(mw._classify_pending(store, {}), 1)
+        self.assertEqual(store.items[0]["category"], "routine")
+        self.assertEqual(store.suppressed, [row["token"]])
+
+    @mock.patch("mail_watch.subprocess.run", side_effect=RuntimeError("offline"))
+    def test_owner_rule_survives_fallback_circuit(self, run):
+        rows = [
+            item(
+                token=f"{index:016x}",
+                gmail_id=f"gmail-{index}",
+                category=None,
+            )
+            for index in range(mw.CLASSIFY_BATCH)
+        ]
+        rows.append(
+            item(
+                token=f"{mw.CLASSIFY_BATCH:016x}",
+                gmail_id=f"gmail-{mw.CLASSIFY_BATCH}",
+                mailbox="nk@eoworking.com",
+                sender_email="ads-account-noreply@ads.google.com",
+                category=None,
+            )
+        )
+        store = FakeStore(rows)
+        self.assertEqual(mw._classify_pending(store, {}), len(rows))
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(store.items[-1]["category"], "routine")
+        self.assertEqual(store.items[-1]["classifier_source"], "owner-rule")
+        self.assertIn(store.items[-1]["token"], store.suppressed)
+
     @mock.patch("mail_watch._classify_batch")
     def test_confident_noise_is_stored_without_telegram_delivery(self, classify):
         row = item(category=None)

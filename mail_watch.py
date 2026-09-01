@@ -83,6 +83,27 @@ SAFETY_FLOOR = re.compile(
     re.IGNORECASE,
 )
 
+# Explicit owner rules outrank the model but not the high-risk subject floor.
+# The same automated sender can matter differently in different accounts.
+OWNER_CLASSIFICATION_RULES = {
+    (
+        "nk@eoworking.com",
+        "ads-account-noreply@ads.google.com",
+    ): (
+        "routine",
+        1.0,
+        "правило Никиты: Google Ads в этом ящике неважно",
+    ),
+    (
+        "business@ddinsights.org",
+        "ads-account-noreply@ads.google.com",
+    ): (
+        "important",
+        1.0,
+        "правило Никиты: Google Ads в этом ящике важно",
+    ),
+}
+
 
 def log(message: str) -> None:
     print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
@@ -598,6 +619,40 @@ def _domain(address: str) -> str:
     return address.rsplit("@", 1)[-1] if "@" in address else ""
 
 
+def _owner_classification_rule(message: dict) -> tuple[str, float, str] | None:
+    key = (
+        (message.get("mailbox") or "").strip().lower(),
+        (message.get("sender_email") or "").strip().lower(),
+    )
+    return OWNER_CLASSIFICATION_RULES.get(key)
+
+
+def _apply_owner_and_safety_policy(message: dict, verdict: dict) -> dict:
+    """Apply deterministic owner rules after any model or fallback verdict."""
+    result = {**verdict}
+    owner_rule = _owner_classification_rule(message)
+    if owner_rule:
+        category, confidence, why = owner_rule
+        result.update(
+            category=category,
+            confidence=confidence,
+            why=why,
+            source="owner-rule",
+        )
+    if (
+        SAFETY_FLOOR.search(message.get("subject") or "")
+        and result.get("category") not in NOTIFY
+    ):
+        result.update(
+            category="important",
+            confidence=min(float(result.get("confidence") or 0.0), 0.7),
+            why="защитный порог по теме; "
+            + (result.get("why") or "нужна проверка"),
+            source="safety-floor",
+        )
+    return result
+
+
 def _select_feedback(items: list[dict], examples: list[dict], limit: int = 30) -> list[dict]:
     senders = {item.get("sender_email", "") for item in items}
     domains = {_domain(value) for value in senders if value}
@@ -729,6 +784,8 @@ def _classify_batch(items: list[dict], examples: list[dict], meta: dict) -> list
         verdicts = []
         source = "fallback"
 
+    classifier_failed = source == "fallback"
+
     by_index = {
         item.get("i"): item for item in verdicts if isinstance(item, dict)
     }
@@ -741,23 +798,25 @@ def _classify_batch(items: list[dict], examples: list[dict], meta: dict) -> list
             category = "important"
             item_source = "fallback"
         try:
-            confidence = min(1.0, max(0.0, float(verdict.get("confidence", 0.0))))
+            confidence = min(
+                1.0,
+                max(0.0, float(verdict.get("confidence", 0.0))),
+            )
         except (TypeError, ValueError):
             confidence = 0.0
         why = _san(str(verdict.get("why") or ""), 500)
-        if SAFETY_FLOOR.search(message.get("subject") or "") and category not in NOTIFY:
-            category = "important"
-            confidence = min(confidence, 0.7)
-            why = "защитный порог по теме; " + (why or "нужна проверка")
-            item_source = "safety-floor"
         output.append(
-            {
-                **message,
-                "category": category,
-                "confidence": confidence,
-                "why": why,
-                "source": item_source,
-            }
+            _apply_owner_and_safety_policy(
+                message,
+                {
+                    **message,
+                    "category": category,
+                    "confidence": confidence,
+                    "why": why,
+                    "source": item_source,
+                    "classifier_failed": classifier_failed,
+                },
+            )
         )
     return output
 
@@ -772,17 +831,21 @@ def _classify_pending(store: MailStore, meta: dict) -> int:
             break
         if classifier_open:
             verdicts = _classify_batch(batch, examples, meta)
-            if verdicts and all(row.get("source") == "fallback" for row in verdicts):
+            if verdicts and verdicts[0].get("classifier_failed"):
                 classifier_open = False
         else:
             verdicts = [
-                {
-                    **row,
-                    "category": "important",
-                    "confidence": 0.0,
-                    "why": "классификатор недоступен; fail-open",
-                    "source": "fallback-circuit",
-                }
+                _apply_owner_and_safety_policy(
+                    row,
+                    {
+                        **row,
+                        "category": "important",
+                        "confidence": 0.0,
+                        "why": "классификатор недоступен; fail-open",
+                        "source": "fallback-circuit",
+                        "classifier_failed": True,
+                    },
+                )
                 for row in batch
             ]
         for verdict in verdicts:
