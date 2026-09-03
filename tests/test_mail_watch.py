@@ -641,11 +641,18 @@ class SubscriberFilterTests(unittest.TestCase):
                 mailing_list=0,
             ))
         )
-        self.assertEqual(
+        self.assertIsNone(
             mw._claude_subscription_topic(item(
                 mailbox="business@ddinsights.org",
                 sender_email="ad-api-notifications@snapchat.com",
                 subject="Your ad has been approved",
+            ))
+        )
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="ad-api-notifications@snapchat.com",
+                subject="Your ad has been rejected",
             )),
             "platform-notice",
         )

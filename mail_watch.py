@@ -1022,6 +1022,13 @@ def _claude_subscription_topic(item: dict) -> str | None:
         "snap-ads-receipts-cc@snapchat.com",
     } or sender.endswith("@t.appfigures.com"):
         return None
+    if sender == "ad-api-notifications@snapchat.com" and subject.rstrip(".! ") in {
+        "your ad has been approved",
+        "your ads have been approved",
+    }:
+        # A rejection from this same address must still pass. Suppress only
+        # exact known-positive subjects; unknown wording remains visible.
+        return None
     _, separator, domain = sender.partition("@")
     automated_sender = _is_automated_sender(sender)
     platform_notice = (
