@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_CONFIG = Path.home() / ".config/agent_gmail/mysql.json"
 
 
@@ -171,6 +171,7 @@ class MailStore:
                 mailbox VARCHAR(320) NOT NULL,
                 gmail_id VARCHAR(64) NOT NULL,
                 thread_id VARCHAR(64),
+                thread_has_prior_sent BOOLEAN,
                 sender VARCHAR(1000),
                 sender_email VARCHAR(320),
                 subject VARCHAR(1000),
@@ -244,6 +245,7 @@ class MailStore:
                 "metadata_next_attempt_at": "BIGINT",
                 "metadata_dead_at": "BIGINT",
                 "promotion_pending": "BOOLEAN NOT NULL DEFAULT FALSE",
+                "thread_has_prior_sent": "BOOLEAN",
             }
             for name, ddl in upgrades.items():
                 if name not in columns:
@@ -405,6 +407,7 @@ class MailStore:
         sender_email: str,
         subject: str,
         thread_id: str,
+        thread_has_prior_sent: bool | None,
         received_at: str,
         gmail_labels: Iterable[str],
         mailing_list: bool,
@@ -416,7 +419,8 @@ class MailStore:
             raise ValueError("subscriber and topic must be provided together")
         with self._tx() as cursor:
             cursor.execute(
-                "UPDATE messages SET thread_id = %s, sender = %s, sender_email = %s, "
+                "UPDATE messages SET thread_id = %s, thread_has_prior_sent = %s, "
+                "sender = %s, sender_email = %s, "
                 "subject = %s, received_at = %s, gmail_labels = %s, mailing_list = %s, "
                 "metadata_attempts = metadata_attempts + 1, "
                 "metadata_next_attempt_at = NULL, metadata_dead_at = NULL, "
@@ -424,6 +428,7 @@ class MailStore:
                 "WHERE token = %s",
                 (
                     thread_id,
+                    thread_has_prior_sent,
                     sender,
                     sender_email,
                     subject,
@@ -686,8 +691,9 @@ class MailStore:
             "m.* FROM subscriber_deliveries d JOIN messages m ON m.token = d.token "
             "WHERE d.subscriber = %s AND d.delivered_at IS NULL "
             "ORDER BY CASE d.topic "
-            "WHEN 'outreach-reply' THEN 0 WHEN 'google-play' THEN 1 "
-            "WHEN 'crazygames' THEN 2 ELSE 3 END, d.queued_at, d.id LIMIT %s",
+            "WHEN 'outreach-reply' THEN 0 WHEN 'human-inbound' THEN 1 "
+            "WHEN 'google-play' THEN 2 WHEN 'crazygames' THEN 3 "
+            "ELSE 4 END, d.queued_at, d.id LIMIT %s",
             (subscriber, limit),
         )
 

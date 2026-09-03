@@ -44,12 +44,16 @@ class MailStoreIntegrationTests(unittest.TestCase):
             sender_email="test@example.invalid",
             subject="Action required",
             thread_id="thread",
+            thread_has_prior_sent=True,
             received_at="now",
             gmail_labels=["INBOX", "IMPORTANT"],
             mailing_list=False,
         )
         self.store.set_classification(
             target["token"], "important", 0.8, "test", "unit", now=102
+        )
+        self.assertEqual(
+            self.store.get_message(target["token"])["thread_has_prior_sent"], 1
         )
         hot = [row for row in self.store.pending_hot(0.72, 100) if row["mailbox"] == self.mailbox]
         self.assertEqual([row["token"] for row in hot], [target["token"]])

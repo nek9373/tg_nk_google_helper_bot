@@ -118,6 +118,7 @@ def item(**overrides):
         "sender": "Alice <alice@example.com>",
         "sender_email": "alice@example.com",
         "subject": "Please review",
+        "thread_has_prior_sent": None,
         "gmail_labels": '["INBOX"]',
         "mailing_list": 0,
         "category": "important",
@@ -161,6 +162,17 @@ class ParsingTests(unittest.TestCase):
         payloads = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
         self.assertEqual(len(payloads), 4)
         self.assertTrue(all(len(value.encode()) <= 64 for value in payloads))
+
+    def test_classifier_prompt_exposes_tri_state_reply_evidence(self):
+        rows = [
+            item(token="0000000000000001", thread_has_prior_sent=True),
+            item(token="0000000000000002", thread_has_prior_sent=False),
+            item(token="0000000000000003", thread_has_prior_sent=None),
+        ]
+        prompt = mw._build_prompt(rows, [], {})
+        self.assertIn("our-prior-sent-in-thread: yes", prompt)
+        self.assertIn("our-prior-sent-in-thread: no", prompt)
+        self.assertIn("our-prior-sent-in-thread: unknown", prompt)
 
 
 class ClassifierTests(unittest.TestCase):
@@ -675,6 +687,7 @@ class SubscriberFilterTests(unittest.TestCase):
                 sender_email="partner@snapchat.com",
                 subject="Re: your campaign",
                 mailing_list=0,
+                thread_has_prior_sent=True,
             )),
             "outreach-reply",
         )
@@ -684,6 +697,30 @@ class SubscriberFilterTests(unittest.TestCase):
                 sender_email="editor@gameportal.example",
                 subject="Your game review",
                 mailing_list=0,
+            )),
+            "human-inbound",
+        )
+
+    def test_fake_re_without_sent_thread_is_not_an_outreach_reply(self):
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="sales@agency.example",
+                subject="Re: our last follow up",
+                mailing_list=0,
+                thread_has_prior_sent=False,
+            )),
+            "human-inbound",
+        )
+
+    def test_prior_sent_thread_is_reply_even_without_re_prefix(self):
+        self.assertEqual(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="editor@portal.example",
+                subject="Updated review schedule",
+                mailing_list=0,
+                thread_has_prior_sent=True,
             )),
             "outreach-reply",
         )
@@ -750,12 +787,19 @@ class GmailRecoveryTests(unittest.TestCase):
         service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
             "id": "abc",
             "threadId": "thread",
+            "internalDate": "2000",
             "labelIds": ["INBOX"],
             "payload": {"headers": [
                 {"name": "From", "value": "hello <hello@rovingames.com>"},
                 {"name": "Subject", "value": "Re: Android games list"},
                 {"name": "Date", "value": "Thu, 3 Sep 2026 18:22:00 +0300"},
             ]},
+        }
+        service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+            "messages": [
+                {"id": "sent", "labelIds": ["SENT"], "internalDate": "1000"},
+                {"id": "abc", "labelIds": ["INBOX"], "internalDate": "2000"},
+            ]
         }
         row = item(
             sender=None,
@@ -768,6 +812,82 @@ class GmailRecoveryTests(unittest.TestCase):
         kwargs = store.set_metadata.call_args.kwargs
         self.assertEqual(kwargs["subscriber"], "claude")
         self.assertEqual(kwargs["topic"], "outreach-reply")
+        self.assertIs(kwargs["thread_has_prior_sent"], True)
+
+    @mock.patch("mail_watch.gt._service")
+    def test_hydration_marks_fake_re_as_human_inbound(self, service_factory):
+        service = mock.MagicMock()
+        service_factory.return_value = service
+        service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+            "id": "abc",
+            "threadId": "thread",
+            "internalDate": "2000",
+            "labelIds": ["INBOX"],
+            "payload": {"headers": [
+                {"name": "From", "value": "Sales <sales@agency.example>"},
+                {"name": "Subject", "value": "Re: last follow up"},
+                {"name": "Date", "value": "Thu, 3 Sep 2026 18:22:00 +0300"},
+            ]},
+        }
+        service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+            "messages": [
+                {"id": "old-inbound", "labelIds": ["INBOX"], "internalDate": "1000"},
+                {"id": "abc", "labelIds": ["INBOX"], "internalDate": "2000"},
+            ]
+        }
+        store = mock.MagicMock()
+        store.unhydrated.return_value = [item(
+            sender=None,
+            mailbox="business@ddinsights.org",
+            category=None,
+        )]
+
+        self.assertEqual(mw._hydrate_pending(store), 1)
+        kwargs = store.set_metadata.call_args.kwargs
+        self.assertEqual(kwargs["topic"], "human-inbound")
+        self.assertIs(kwargs["thread_has_prior_sent"], False)
+
+    def test_thread_reply_evidence_ignores_later_sent_and_requests_metadata_only(self):
+        service = mock.MagicMock()
+        service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+            "messages": [
+                {"id": "inbound", "labelIds": ["INBOX"], "internalDate": "2000"},
+                {"id": "later-reply", "labelIds": ["SENT"], "internalDate": "3000"},
+            ]
+        }
+
+        self.assertFalse(mw._thread_has_prior_sent_message(service, "thread", 2000))
+        kwargs = service.users.return_value.threads.return_value.get.call_args.kwargs
+        self.assertEqual(kwargs["format"], "metadata")
+        self.assertEqual(kwargs["metadataHeaders"], ["From"])
+
+    @mock.patch("mail_watch.gt._service")
+    def test_thread_lookup_failure_keeps_human_signal_as_unknown(self, service_factory):
+        service = mock.MagicMock()
+        service_factory.return_value = service
+        service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+            "id": "abc",
+            "threadId": "thread",
+            "internalDate": "2000",
+            "labelIds": ["INBOX"],
+            "payload": {"headers": [
+                {"name": "From", "value": "Editor <editor@portal.example>"},
+                {"name": "Subject", "value": "Re: Your game"},
+                {"name": "Date", "value": "Thu, 3 Sep 2026 18:22:00 +0300"},
+            ]},
+        }
+        service.users.return_value.threads.return_value.get.return_value.execute.side_effect = RuntimeError("temporary")
+        store = mock.MagicMock()
+        store.unhydrated.return_value = [item(
+            sender=None,
+            mailbox="business@ddinsights.org",
+            category=None,
+        )]
+
+        self.assertEqual(mw._hydrate_pending(store), 1)
+        kwargs = store.set_metadata.call_args.kwargs
+        self.assertEqual(kwargs["topic"], "human-inbound")
+        self.assertIsNone(kwargs["thread_has_prior_sent"])
 
     def test_cold_start_query_explicitly_excludes_spam_and_trash(self):
         service = mock.MagicMock()
