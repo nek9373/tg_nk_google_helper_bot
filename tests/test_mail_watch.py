@@ -55,7 +55,8 @@ class FakeStore:
         return []
 
     def unclassified(self, limit):
-        return [row for row in self.items if row.get("category") is None][:limit]
+        rows = [row for row in self.items if row.get("category") is None]
+        return rows if limit is None else rows[:limit]
 
     def set_classification(self, token, category, confidence, why, source):
         for row in self.items:
@@ -179,6 +180,16 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(result[0]["source"], "safety-floor")
 
     @mock.patch("mail_watch.subprocess.run")
+    def test_safety_floor_does_not_downgrade_model_urgent(self, run):
+        verdict = [{"i": 1, "category": "urgent", "confidence": .99, "why": "act now"}]
+        run.return_value = mock.Mock(returncode=0, stdout=json.dumps(verdict), stderr="")
+        row = item(subject="Security alert", category=None)
+        store = FakeStore([row])
+        self.assertEqual(mw._classify_pending(store, {}), 1)
+        self.assertEqual(store.items[0]["category"], "urgent")
+        self.assertEqual(store.items[0]["classifier_source"], "opus")
+
+    @mock.patch("mail_watch.subprocess.run")
     def test_google_ads_owner_rule_depends_on_mailbox(self, run):
         verdicts = [
             {"i": 1, "category": "urgent", "confidence": .99, "why": "model high"},
@@ -248,30 +259,117 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(store.suppressed, [row["token"]])
 
     @mock.patch("mail_watch.subprocess.run", side_effect=RuntimeError("offline"))
-    def test_owner_rule_survives_fallback_circuit(self, run):
+    def test_classifier_failure_defers_unknown_but_applies_owner_rule(self, run):
         rows = [
             item(
                 token=f"{index:016x}",
                 gmail_id=f"gmail-{index}",
                 category=None,
             )
-            for index in range(mw.CLASSIFY_BATCH)
+            for index in range(mw.CLASSIFY_BATCH - 1)
         ]
         rows.append(
             item(
-                token=f"{mw.CLASSIFY_BATCH:016x}",
-                gmail_id=f"gmail-{mw.CLASSIFY_BATCH}",
+                token=f"{mw.CLASSIFY_BATCH - 1:016x}",
+                gmail_id=f"gmail-{mw.CLASSIFY_BATCH - 1}",
                 mailbox="nk@eoworking.com",
                 sender_email="ads-account-noreply@ads.google.com",
                 category=None,
             )
         )
         store = FakeStore(rows)
-        self.assertEqual(mw._classify_pending(store, {}), len(rows))
+        self.assertEqual(mw._classify_pending(store, {}), 1)
         self.assertEqual(run.call_count, 1)
+        self.assertTrue(all(row["category"] is None for row in store.items[:-1]))
         self.assertEqual(store.items[-1]["category"], "routine")
         self.assertEqual(store.items[-1]["classifier_source"], "owner-rule")
         self.assertIn(store.items[-1]["token"], store.suppressed)
+
+    @mock.patch("mail_watch.subprocess.run", side_effect=RuntimeError("offline"))
+    def test_classifier_failure_still_applies_safety_floor(self, run):
+        risky = item(category=None, subject="Payment failed")
+        ordinary = item(
+            token="fedcba9876543210",
+            gmail_id="ordinary",
+            category=None,
+            subject="Weekly update",
+        )
+        store = FakeStore([risky, ordinary])
+        self.assertEqual(mw._classify_pending(store, {}), 1)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(store.items[0]["category"], "important")
+        self.assertEqual(store.items[0]["classifier_source"], "safety-floor")
+        self.assertIsNone(store.items[1]["category"])
+
+    @mock.patch("mail_watch.subprocess.run")
+    def test_partial_classifier_reply_commits_valid_row_only(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps([
+                {"i": 1, "category": "routine", "confidence": .9, "why": "status"},
+                {"i": 2, "confidence": .9, "why": "missing category"},
+            ]),
+            stderr="",
+        )
+        rows = [
+            item(token="0000000000000001", gmail_id="one", category=None),
+            item(token="0000000000000002", gmail_id="two", category=None),
+        ]
+        store = FakeStore(rows)
+        self.assertEqual(mw._classify_pending(store, {}), 1)
+        self.assertEqual(store.items[0]["category"], "routine")
+        self.assertIsNone(store.items[1]["category"])
+
+    @mock.patch("mail_watch.subprocess.run")
+    def test_malformed_classifier_indices_cannot_crash_or_override(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=json.dumps([
+                {"i": 1, "category": "routine", "confidence": .9},
+                {"i": [], "category": "urgent", "confidence": 1},
+                {"i": 99, "category": "urgent", "confidence": 1},
+                {"i": 1, "category": "urgent", "confidence": 1},
+            ]),
+            stderr="",
+        )
+        rows = [
+            item(token="0000000000000001", gmail_id="one", category=None),
+            item(token="0000000000000002", gmail_id="two", category=None),
+        ]
+        result = mw._classify_batch(rows, [], {})
+        self.assertEqual(result[0]["category"], "routine")
+        self.assertEqual(result[0]["source"], "opus")
+        self.assertTrue(result[1]["classifier_failed"])
+
+    @mock.patch("mail_watch.subprocess.run", side_effect=RuntimeError("offline"))
+    def test_safety_floor_scans_beyond_first_model_batch(self, run):
+        rows = [
+            item(
+                token=f"{index:016x}",
+                gmail_id=f"ordinary-{index}",
+                category=None,
+                subject="Weekly update",
+            )
+            for index in range(mw.CLASSIFY_BATCH)
+        ]
+        rows.append(item(
+            token="ffffffffffffffff",
+            gmail_id="risk-after-head",
+            category=None,
+            subject="Payment failed",
+        ))
+        store = FakeStore(rows)
+        self.assertEqual(mw._classify_pending(store, {}), 1)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(store.items[-1]["category"], "important")
+        self.assertEqual(store.items[-1]["classifier_source"], "safety-floor")
+        self.assertTrue(all(row["category"] is None for row in store.items[:-1]))
+
+    @mock.patch("mail_watch._classify_batch", return_value=[])
+    def test_empty_classifier_batch_returns_without_loop(self, classify):
+        store = FakeStore([item(category=None)])
+        self.assertEqual(mw._classify_pending(store, {}), 0)
+        classify.assert_called_once()
 
     @mock.patch("mail_watch._classify_batch")
     def test_confident_noise_is_stored_without_telegram_delivery(self, classify):
@@ -332,6 +430,47 @@ class TelegramTests(unittest.TestCase):
                 mw._tg("getUpdates")
         self.assertNotIn(canary, str(caught.exception))
         self.assertIn("transport ConnectionError", str(caught.exception))
+
+    def test_status_reports_stale_cycle_instead_of_false_healthy(self):
+        store = mock.MagicMock()
+        store.stats.return_value = {
+            "mailboxes": 7,
+            "total": 10,
+            "unhydrated": 0,
+            "dead_metadata": 0,
+            "unclassified": 0,
+            "undelivered": 0,
+            "promotions": 0,
+            "subscriber_pending": 0,
+            "corrected": 0,
+        }
+        store.mailbox_status.return_value = []
+        store.get_meta.return_value = "100"
+        with mock.patch("mail_watch.time.time", return_value=100 + mw.HEALTH_STALE_AFTER + 1):
+            status = mw._status_text(store)
+        self.assertIn("не отвечает", status)
+        self.assertNotIn("Почтовый наблюдатель: работает", status)
+
+    @mock.patch("mail_watch.POLL_INTERVAL", 0)
+    @mock.patch("mail_watch.TELEGRAM_LONG_POLL", 0)
+    @mock.patch("mail_watch._poll_telegram")
+    @mock.patch("mail_watch._mail_cycle", side_effect=RuntimeError("db offline"))
+    @mock.patch("mail_watch._tg", return_value={"username": "nk_google_helper_bot"})
+    @mock.patch("mail_watch._bootstrap_telegram_offset")
+    @mock.patch("mail_watch._open_store")
+    @mock.patch("mail_watch._exclusive")
+    def test_three_failed_cycles_exit_for_systemd_restart(
+        self, exclusive, open_store, _bootstrap, _tg, mail_cycle, _poll
+    ):
+        store = mock.MagicMock()
+        open_store.return_value = store
+        lock = mock.MagicMock()
+        exclusive.return_value = lock
+        with self.assertRaisesRegex(RuntimeError, "передаю восстановление systemd"):
+            mw.cmd_run(mock.Mock())
+        self.assertEqual(mail_cycle.call_count, mw.MAX_CONSECUTIVE_CYCLE_FAILURES)
+        store.close.assert_called_once()
+        lock.close.assert_called_once()
 
     @mock.patch("mail_watch._tg")
     def test_missing_offset_keeps_pending_updates(self, tg):
@@ -396,6 +535,9 @@ class DeliveryTests(unittest.TestCase):
             subscriber="claude",
             subscriber_delivery_id=9,
             topic="crazygames",
+            mailbox="business@ddinsights.org",
+            sender_email="no-reply@crazygames.com",
+            subject="Crosswise is live",
         )
         store = FakeStore([event])
         self.assertEqual(mw._deliver_subscriber(store, "claude"), 1)
@@ -409,11 +551,29 @@ class DeliveryTests(unittest.TestCase):
             subscriber="claude",
             subscriber_delivery_id=9,
             topic="google-play",
+            mailbox="business@ddinsights.org",
+            sender_email="googleplay-noreply@google.com",
+            subject="Production release is live",
         )
         store = FakeStore([event])
         self.assertEqual(mw._deliver_subscriber(store, "claude"), 0)
         self.assertEqual(store.subscriber_delivered, [])
         self.assertEqual(store.subscriber_errors[0][0], 9)
+
+    @mock.patch("mail_watch._peer_tell")
+    def test_pending_billing_subscription_is_suppressed_by_current_policy(self, tell):
+        event = item(
+            subscriber="claude",
+            subscriber_delivery_id=9,
+            topic="platform-notice",
+            mailbox="business@ddinsights.org",
+            sender_email="payments-noreply@google.com",
+            subject="Your invoice",
+        )
+        store = FakeStore([event])
+        self.assertEqual(mw._deliver_subscriber(store, "claude"), 0)
+        self.assertEqual(store.subscriber_delivered, [9])
+        tell.assert_not_called()
 
     @mock.patch("mail_watch.subprocess.run")
     def test_peer_delivery_uses_stdin_and_explicit_codex_identity(self, run):
@@ -447,13 +607,27 @@ class SubscriberFilterTests(unittest.TestCase):
             )),
             "platform-notice",
         )
-        self.assertEqual(
+        self.assertIsNone(
             mw._claude_subscription_topic(item(
                 mailbox="business@ddinsights.org",
                 sender_email="snap-ads-receipts-cc@snapchat.com",
                 subject="How you are going to be charged",
-            )),
-            "platform-notice",
+            ))
+        )
+        self.assertIsNone(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="payments-noreply@google.com",
+                subject="Your Google Cloud invoice",
+            ))
+        )
+        self.assertIsNone(
+            mw._claude_subscription_topic(item(
+                mailbox="business@ddinsights.org",
+                sender_email="ariel.m@t.appfigures.com",
+                subject="Your trial has ended",
+                mailing_list=0,
+            ))
         )
         self.assertEqual(
             mw._claude_subscription_topic(item(
@@ -568,6 +742,32 @@ class GmailRecoveryTests(unittest.TestCase):
             "ignored Gmail folder labels: SPAM",
             permanent=True,
         )
+
+    @mock.patch("mail_watch.gt._service")
+    def test_hydration_atomically_routes_human_business_reply(self, service_factory):
+        service = mock.MagicMock()
+        service_factory.return_value = service
+        service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+            "id": "abc",
+            "threadId": "thread",
+            "labelIds": ["INBOX"],
+            "payload": {"headers": [
+                {"name": "From", "value": "hello <hello@rovingames.com>"},
+                {"name": "Subject", "value": "Re: Android games list"},
+                {"name": "Date", "value": "Thu, 3 Sep 2026 18:22:00 +0300"},
+            ]},
+        }
+        row = item(
+            sender=None,
+            mailbox="business@ddinsights.org",
+            category=None,
+        )
+        store = mock.MagicMock()
+        store.unhydrated.return_value = [row]
+        self.assertEqual(mw._hydrate_pending(store), 1)
+        kwargs = store.set_metadata.call_args.kwargs
+        self.assertEqual(kwargs["subscriber"], "claude")
+        self.assertEqual(kwargs["topic"], "outreach-reply")
 
     def test_cold_start_query_explicitly_excludes_spam_and_trash(self):
         service = mock.MagicMock()

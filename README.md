@@ -19,7 +19,8 @@
 отдельные события CrazyGames и Google Play, а также любые человеческие входящие
 ответы площадок. Событие содержит только mailbox, gmail_id, sender, subject и
 topic; тело Клоди при необходимости читает сама через `gmail_tool.py read`.
-Доставка at-least-once, дедупликация — по gmail_id.
+Sender-доставка at-least-once, дедупликация — по gmail_id. Квитанция
+`peer.py tell` подтверждает приём транспортом, а не завершение turn у Клоди.
 
 ## Что видит Никита
 
@@ -58,11 +59,12 @@ topic; тело Клоди при необходимости читает сам
 
 1. Gmail отдаёт новые message id и следующий `historyId`.
 2. Все id и новый cursor фиксируются одной MySQL-транзакцией.
-3. Отдельно подтягиваются только метаданные, затем классификация.
+3. Отдельно подтягиваются только метаданные; subscriber-outbox создаётся с ними
+   атомарно и не ждёт классификатор, затем запускается оценка важности.
 4. Только успешный `sendMessage` помечает письмо доставленным.
 5. Любая ошибка оставляет запись в очереди для следующей попытки.
-6. Релевантные Клоди письма получают независимую subscriber-outbox; её ack
-   ставится только после успешного `peer.py tell`.
+6. Релевантные Клоди письма получают независимую subscriber-outbox; её
+   transport ack ставится только после успешного `peer.py tell`.
 
 Папки Spam и Trash не опрашиваются. Кроме фильтров Gmail, worker повторно
 требует текущую метку Inbox и отсутствие Spam/Trash/Draft/Sent при получении
@@ -83,7 +85,12 @@ metadata. Не прошедшие этот барьер письма fail-closed
 - второй worker/ручной `once` получает явный отказ через локальный lock и
   глобальный MySQL lease;
 - callbacks принимаются только от привязанного Telegram user id;
-- поломка Opus fail-open: письмо считается `important`.
+- сбой Opus не превращает backlog в поток ложных `important`: неизвестные
+  письма остаются в очереди, а точные правила владельца и защитный порог по
+  платёжным/безопасностным темам продолжают работать по всей очереди;
+- после трёх подряд незавершённых почтовых циклов worker выходит с ошибкой и
+  передаёт восстановление `systemd`; `/status` отдельно показывает протухший
+  последний цикл, а не ложное «работает».
 
 ## Приватность и классификация
 
@@ -136,7 +143,13 @@ python3 -m venv .venv
   --user mail_watch
 
 install -m 644 mail-watch.service ~/.config/systemd/user/mail-watch.service
+install -m 644 mail-watch-firewall-sync.service \
+  ~/.config/systemd/user/mail-watch-firewall-sync.service
+install -m 644 mail-watch-firewall-sync.timer \
+  ~/.config/systemd/user/mail-watch-firewall-sync.timer
 systemctl --user daemon-reload
+systemctl --user start mail-watch-firewall-sync.service
+systemctl --user enable --now mail-watch-firewall-sync.timer
 systemctl --user enable --now mail-watch.service
 ```
 
@@ -145,6 +158,26 @@ systemctl --user enable --now mail-watch.service
 пишет runtime-config без вывода пароля в терминал. Provisioner добавляет текущий
 public IP в DigitalOcean trusted sources через GET→merge→PUT→readback, выполняет
 миграцию схемы и затем оставляет runtime-пользователю только DML в `agent_mail`.
+
+Домашний public IPv4 может смениться уже после provisioning. Отдельный
+`sync_do_firewall.py` каждые пять минут синхронизирует DigitalOcean trusted
+sources: читает `cluster_id` из существующего `mysql.json`, требует совпадения
+адреса у `api.ipify.org` и `checkip.amazonaws.com`, заменяет только правило с
+точным описанием `nk_google_helper mail watcher` и сохраняет все остальные
+правила. Перед полным PUT он повторно читает firewall и отменяет действие при
+уже видимой конкурентной правке, а после PUT делает exact readback. API не даёт
+CAS/ETag, поэтому второй GET лишь сужает неизбежное окно гонки между ним и PUT,
+но не объявляется строгой гарантией. При любой обнаруженной неоднозначности
+команда завершается с ошибкой без мутации. Token, пароль и IP в журнал не
+выводятся.
+
+Ручная проверка и журнал синхронизатора:
+
+```bash
+.venv/bin/python sync_do_firewall.py
+systemctl --user status mail-watch-firewall-sync.timer
+journalctl --user -u mail-watch-firewall-sync.service
+```
 
 Первичная привязка Telegram выполняется только при остановленном worker:
 

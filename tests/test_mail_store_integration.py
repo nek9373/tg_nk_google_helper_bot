@@ -80,10 +80,19 @@ class MailStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(
             self.store.get_message(target["token"])["delivery_kind"], "suppressed"
         )
-        pending = self.store.pending_subscriber("claude", 10)
+        pending = [
+            row for row in self.store.pending_subscriber("claude", 100)
+            if row["mailbox"] == self.mailbox
+        ]
         self.assertEqual([row["token"] for row in pending], [target["token"]])
         self.store.mark_subscriber_delivered(pending[0]["subscriber_delivery_id"], now=109)
-        self.assertEqual(self.store.pending_subscriber("claude", 10), [])
+        self.assertEqual(
+            [
+                row for row in self.store.pending_subscriber("claude", 100)
+                if row["mailbox"] == self.mailbox
+            ],
+            [],
+        )
 
     def test_dead_letter_backoff_rename_and_global_lease(self):
         self.store.stage_discovery(self.mailbox, "h200", ["dead", "retry"], now=200)

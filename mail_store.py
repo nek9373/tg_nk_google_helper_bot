@@ -408,7 +408,12 @@ class MailStore:
         received_at: str,
         gmail_labels: Iterable[str],
         mailing_list: bool,
+        subscriber: str | None = None,
+        topic: str | None = None,
+        now: int | None = None,
     ) -> None:
+        if bool(subscriber) != bool(topic):
+            raise ValueError("subscriber and topic must be provided together")
         with self._tx() as cursor:
             cursor.execute(
                 "UPDATE messages SET thread_id = %s, sender = %s, sender_email = %s, "
@@ -428,6 +433,12 @@ class MailStore:
                     token,
                 ),
             )
+            if subscriber and topic:
+                cursor.execute(
+                    "INSERT IGNORE INTO subscriber_deliveries("
+                    "subscriber, token, topic, queued_at) VALUES(%s, %s, %s, %s)",
+                    (subscriber[:64], token, topic[:64], int(now or time.time())),
+                )
 
     def record_metadata_error(
         self,
@@ -462,11 +473,14 @@ class MailStore:
                 ),
             )
 
-    def unclassified(self, limit: int = 20) -> list[dict]:
-        return self._fetchall(
+    def unclassified(self, limit: int | None = 20) -> list[dict]:
+        sql = (
             "SELECT * FROM messages WHERE sender IS NOT NULL AND category IS NULL "
-            "ORDER BY discovered_at, mailbox LIMIT %s", (limit,)
+            "ORDER BY discovered_at, mailbox"
         )
+        if limit is None:
+            return self._fetchall(sql)
+        return self._fetchall(sql + " LIMIT %s", (limit,))
 
     def set_classification(
         self,
@@ -671,7 +685,9 @@ class MailStore:
             "d.queued_at AS subscriber_queued_at, d.delivery_attempts AS subscriber_attempts, "
             "m.* FROM subscriber_deliveries d JOIN messages m ON m.token = d.token "
             "WHERE d.subscriber = %s AND d.delivered_at IS NULL "
-            "ORDER BY d.queued_at, d.id LIMIT %s",
+            "ORDER BY CASE d.topic "
+            "WHEN 'outreach-reply' THEN 0 WHEN 'google-play' THEN 1 "
+            "WHEN 'crazygames' THEN 2 ELSE 3 END, d.queued_at, d.id LIMIT %s",
             (subscriber, limit),
         )
 

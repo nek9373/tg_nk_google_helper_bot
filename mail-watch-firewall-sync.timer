@@ -1,0 +1,12 @@
+[Unit]
+Description=Mail watcher — refresh DigitalOcean MySQL trusted-source IP every 5 minutes
+
+[Timer]
+Unit=mail-watch-firewall-sync.service
+OnBootSec=20s
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

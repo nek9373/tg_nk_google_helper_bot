@@ -1,0 +1,16 @@
+[Unit]
+Description=Mail watcher — synchronize DigitalOcean MySQL trusted-source IP
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/PycharmProjects/tg_nk_google_helper_bot
+UMask=0077
+ExecStartPre=/usr/bin/test -r %h/.config/agent_gmail/mysql.json
+ExecStartPre=/usr/bin/test -r %h/.config/aeolian/do_token
+ExecStart=%h/PycharmProjects/tg_nk_google_helper_bot/.venv/bin/python %h/PycharmProjects/tg_nk_google_helper_bot/sync_do_firewall.py
+NoNewPrivileges=yes
+PrivateTmp=yes
+
