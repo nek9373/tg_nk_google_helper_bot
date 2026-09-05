@@ -107,8 +107,10 @@ OWNER_CLASSIFICATION_RULES = {
 }
 
 # Shared Play developer account: these apps do not belong to Nikita. Only a
-# verified notification envelope and an exact app identity can suppress mail.
-# Unseen titles/templates stay visible until their identity is established.
+# verified notification envelope can suppress mail. Nikita's 2026-09-05 rule
+# also matches these substrings inside the extracted app name, case-insensitively.
+# Revisit if one of Nikita's own apps ever includes one of these names.
+FOREIGN_PLAY_REVIEW_NAME_PARTS = ("wallkade", "sudoku", "wallz")
 FOREIGN_PLAY_REVIEW_APPS = {
     "wallz game: quoridor online": "com.ddinsights.wallz",
     "com.ddinsights.wallz": "com.ddinsights.wallz",
@@ -132,7 +134,13 @@ def _foreign_play_review_app(message: dict) -> str | None:
     match = PLAY_USER_REVIEW_SUBJECT.fullmatch(subject)
     if not match:
         return None
-    return FOREIGN_PLAY_REVIEW_APPS.get(match["app"].casefold())
+    app = match["app"].casefold()
+    known_package = FOREIGN_PLAY_REVIEW_APPS.get(app)
+    if known_package:
+        return known_package
+    # A substring establishes the exclusion rule, not an exact package identity.
+    return next((f"title:{part}" for part in FOREIGN_PLAY_REVIEW_NAME_PARTS
+                 if part in app), None)
 
 
 def log(message: str) -> None:

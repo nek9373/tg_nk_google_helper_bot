@@ -43,17 +43,30 @@ class ForeignReviewIdentityTests(unittest.TestCase):
                      sender_email=" NOREPLY-PLAY-DEVELOPER-CONSOLE@GOOGLE.COM ")
         self.assertEqual(mw._foreign_play_review_app(row), "com.ddinsights.wallz")
 
-    def test_our_unknown_and_lookalike_apps_stay_visible(self):
-        apps = ["Arrow Solitaire: Crosswise", "Mahjong", "Petart", "Sudoku",
-                "Wallz", "Wallkade", "Wallz Game: Quoridor Online 2",
-                "New Game featuring Wallz Game: Quoridor Online",
-                "com.ddinsights.wallz2", "org.ddinsights.arrowclash",
-                "Arrow Solitaire: Crosswise (com.ddinsights.wallz)"]
+    def test_our_and_unmatched_apps_stay_visible(self):
+        apps = ["Arrow Solitaire: Crosswise", "Mahjong (Dragon's Garden)",
+                "Petart", "New Puzzle Game", "org.ddinsights.arrowclash"]
         for app in apps:
             with self.subTest(app=app):
                 row = review(app)
                 self.assertIsNone(mw._foreign_play_review_app(row))
                 self.assertEqual(mw._claude_subscription_topic(row), "platform-notice")
+
+    def test_requested_substrings_match_anywhere_in_app_name(self):
+        names = [
+            ("Sudoku", "sudoku"), ("Daily SuDoKu Challenge", "sudoku"),
+            ("SuperSudokuPro", "sudoku"), ("Wallkade", "wallkade"),
+            ("Online WALLKADE Game", "wallkade"), ("Wallz", "wallz"),
+            ("Wallz Game: Quoridor Online 2", "wallz"),
+            ("New Game featuring Wallz Game: Quoridor Online", "wallz"),
+            ("com.ddinsights.wallz2", "wallz"),
+            ("Arrow Solitaire: Crosswise (com.ddinsights.wallz)", "wallz"),
+        ]
+        for app, part in names:
+            with self.subTest(app=app):
+                row = review(app)
+                self.assertEqual(mw._foreign_play_review_app(row), f"title:{part}")
+                self.assertIsNone(mw._claude_subscription_topic(row))
 
     def test_same_sender_does_not_hide_other_notices_or_changed_templates(self):
         subjects = [
@@ -83,7 +96,7 @@ class ForeignReviewIdentityTests(unittest.TestCase):
     def test_body_or_incidental_mentions_cannot_trigger_exclusion(self):
         row = review("Arrow Solitaire: Crosswise")
         row["body"] = review()["subject"]
-        row["snippet"] = "Wallz Game: Quoridor Online com.ddinsights.wallz"
+        row["snippet"] = "Wallkade Sudoku Wallz Game: Quoridor Online com.ddinsights.wallz"
         self.assertIsNone(mw._foreign_play_review_app(row))
 
     def test_foreign_review_excluded_before_google_platform_route(self):
@@ -99,6 +112,27 @@ class ForeignReviewIdentityTests(unittest.TestCase):
 
 
 class ForeignReviewDeliveryTests(unittest.TestCase):
+    @mock.patch("mail_watch._peer_tell")
+    @mock.patch("mail_watch._tg")
+    @mock.patch("mail_watch._classify_batch")
+    def test_substring_rule_bypasses_model_and_both_stale_queues(self, classify, tg, tell):
+        for app in ["Online WALLKADE Game", "Daily SuDoKu Challenge", "Play Wallz Now"]:
+            with self.subTest(app=app):
+                store = mock.Mock()
+                store.feedback_examples.return_value = []
+                store.unclassified.return_value = [review(app, category=None)]
+                store.pending_hot.return_value = [review(app)]
+                store.pending_subscriber.return_value = [review(app)]
+                self.assertEqual(mw._classify_pending(store, {}), 1)
+                self.assertTrue(store.finalize_classification.call_args.kwargs["suppress"])
+                self.assertEqual(mw._deliver_hot(store), 0)
+                self.assertEqual(mw._deliver_subscriber(store, "claude"), 0)
+                store.mark_suppressed.assert_called_once()
+                store.mark_subscriber_delivered.assert_called_once()
+        classify.assert_not_called()
+        tg.assert_not_called()
+        tell.assert_not_called()
+
     @mock.patch("mail_watch._classify_batch")
     def test_explicit_foreign_exclusion_never_calls_model(self, classify):
         store = mock.Mock()
