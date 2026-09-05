@@ -106,6 +106,34 @@ OWNER_CLASSIFICATION_RULES = {
     ),
 }
 
+# Shared Play developer account: these apps do not belong to Nikita. Only a
+# verified notification envelope and an exact app identity can suppress mail.
+# Unseen titles/templates stay visible until their identity is established.
+FOREIGN_PLAY_REVIEW_APPS = {
+    "wallz game: quoridor online": "com.ddinsights.wallz",
+    "com.ddinsights.wallz": "com.ddinsights.wallz",
+    "com.ddinsights.wallkade": "com.ddinsights.wallkade",
+    "com.ddlnsights.sudokuv20": "com.ddlnsights.sudokuv20",
+}
+PLAY_USER_REVIEW_SUBJECT = re.compile(
+    r"A user has written a new review for (?P<app>.+) on "
+    r"(?:January|February|March|April|May|June|July|August|September|October|"
+    r"November|December) [0-9]{1,2}, [0-9]{4}",
+    re.IGNORECASE,
+)
+
+
+def _foreign_play_review_app(message: dict) -> str | None:
+    """Recognize a known foreign app's review from headers only, fail open."""
+    sender = (message.get("sender_email") or "").strip().lower()
+    if sender != "noreply-play-developer-console@google.com":
+        return None
+    subject = " ".join((message.get("subject") or "").split())
+    match = PLAY_USER_REVIEW_SUBJECT.fullmatch(subject)
+    if not match:
+        return None
+    return FOREIGN_PLAY_REVIEW_APPS.get(match["app"].casefold())
+
 
 def log(message: str) -> None:
     print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
@@ -704,6 +732,12 @@ def _domain(address: str) -> str:
 
 
 def _owner_classification_rule(message: dict) -> tuple[str, float, str] | None:
+    foreign_app = _foreign_play_review_app(message)
+    if foreign_app:
+        return (
+            "noise", 1.0,
+            f"правило Никиты: отзыв о чужом приложении {foreign_app}",
+        )
     key = (
         (message.get("mailbox") or "").strip().lower(),
         (message.get("sender_email") or "").strip().lower(),
@@ -953,7 +987,18 @@ def _classify_pending(store: MailStore, meta: dict) -> int:
     total = 0
     pending = store.unclassified(CLASSIFY_LIMIT)
     for start in range(0, len(pending), CLASSIFY_BATCH):
-        batch = pending[start:start + CLASSIFY_BATCH]
+        batch = []
+        for row in pending[start:start + CLASSIFY_BATCH]:
+            if _foreign_play_review_app(row):
+                # An explicit exclusion needs no model call or review body.
+                _finalize_verdict(store, _apply_owner_and_safety_policy(
+                    row, {**row, "classifier_failed": False}
+                ))
+                total += 1
+            else:
+                batch.append(row)
+        if not batch:
+            continue
         verdicts = _classify_batch(batch, examples, meta)
         if not verdicts:
             log("классификатор вернул пустую пачку; письма оставлены в очереди")
@@ -1014,6 +1059,9 @@ def _claude_subscription_topic(item: dict) -> str | None:
     if (item.get("mailbox") or "").lower() != "business@ddinsights.org":
         return None
     if not _safe_inbound_labels(_stored_gmail_labels(item.get("gmail_labels"))):
+        return None
+    if _foreign_play_review_app(item):
+        # Must precede the broad automated Google platform-notice route.
         return None
     sender = (item.get("sender_email") or "").lower()
     subject = (item.get("subject") or "").lower()
@@ -1131,6 +1179,12 @@ def _deliver_hot(store: MailStore) -> int:
     delivered = 0
     for item in store.pending_hot(CONFIDENCE_FLOOR, HOT_SEND_LIMIT):
         try:
+            if not item.get("user_category") and _foreign_play_review_app(item):
+                # Also drain automatic alerts classified before this policy.
+                # A later explicit per-message choice by Nikita still wins.
+                store.mark_suppressed(item["token"])
+                log(f"foreign-play-review suppressed token={item['token']}")
+                continue
             sent = _tg(
                 "sendMessage",
                 chat_id=_chat_id(store),
